@@ -10,10 +10,15 @@ A desktop application for audio and video transcription on the GNOME desktop.
 ## Core Features
 
 ✅   Transcribe local audio and video files.
+
 ✅   View real-time transcription progress and segment display.
+
 ✅   Display segmented and full transcripts.
+
 ✅   Manage transcription models used by `faster-whisper`.
+
 ✅   View a history of previous transcriptions.
+
 ✅   Export transcripts to various formats.
 
 ## Technology
