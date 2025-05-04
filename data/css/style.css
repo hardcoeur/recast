@@ -1,0 +1,345 @@
+
+window {
+    font-size: 12pt;
+}
+
+label {
+    font-size: 10pt;
+}
+
+textview {
+     font-size: 12pt;
+}
+
+
+.main-hbox,
+.sidebar-vbox,
+.recording-controls-box,
+.initial-view-box,
+.transcript-view-box,
+.transcript-main-box,
+.transcript-toolbar-view,
+.history-view-box,
+.preferences-dialog .dialog-content-box, 
+.dictation-main-box,
+.dictation-status-bar {
+    padding: 6px;
+}
+
+.initial-view-box {
+    padding: 24px; 
+}
+
+.record-button-content-box,
+.transcript-header-box,
+.transcript-segment-content-box,
+.transcript-segment-button-box,
+.history-row-content-box,
+.preferences-box-model-suffix {
+    spacing: 6px;
+}
+
+.transcript-segment-button-box {
+    spacing: 3px; 
+}
+
+.dim-label,
+.initial-view-formats-label,
+.initial-view-drop-label,
+.history-row-timestamp-label,
+.history-placeholder-label {
+    color: rgba(255, 255, 255, 0.7); 
+}
+
+.history-placeholder-label {
+    font-style: italic;
+}
+
+
+.main-menu-button,
+.mode-selector-button,
+.language-selector-button {
+    margin: 3px;
+}
+
+
+.sidebar-vbox {
+    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    background-color: rgba(36, 36, 36, 0.95); 
+}
+
+.sidebar-button {
+    min-width: 80px; 
+    min-height: 80px; 
+    padding: 8px; 
+    border: none;
+    border-radius: 4px;
+    background-color: transparent;
+    
+}
+
+.sidebar-button:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-button:active,
+.sidebar-button:checked { 
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+
+.initial-view-icon {
+    margin-bottom: 12px;
+}
+
+.record-button {
+    padding: 12px;
+    font-weight: bold;
+}
+
+.record-button-label {
+     font-weight: bold;
+}
+
+
+.recording-timer-label {
+    font-family: monospace;
+    margin: 0 6px;
+}
+
+
+.transcript-progress-label {
+    margin-left: 6px;
+    margin-right: 6px;
+}
+
+.transcript-text { 
+    margin-bottom: 6px;
+}
+
+.transcript-list-box listrow, 
+.transcript-segment-row {
+    padding: 8px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0; 
+}
+
+.transcript-list-box listrow:hover,
+.transcript-segment-row:hover {
+    background-color: rgb(230, 230, 230);
+}
+
+.transcript-list-box listrow:last-child,
+.transcript-segment-row:last-child {
+    border-bottom: none; 
+}
+
+
+.history-list-box listrow, 
+.history-list-row {
+    padding: 8px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
+}
+
+.history-list-box listrow:hover,
+.history-list-row:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.history-list-box listrow:last-child,
+.history-list-row:last-child {
+     border-bottom: none;
+}
+
+.history-row-filename-label {
+    font-weight: bold;
+}
+
+
+
+.segments-list-view listrow, 
+.segment-row-box {
+    padding: 8px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
+}
+
+.segments-list-view listrow:hover,
+.segment-row-box:hover {
+     background-color: rgba(255, 255, 255, 0.05);
+}
+
+.segments-list-view listrow:last-child,
+.segment-row-box:last-child {
+      border-bottom: none;
+}
+
+.segment-speaker-label {
+    font-weight: bold;
+    color: #3584E4; 
+    margin-right: 6px;
+}
+
+
+
+.preferences-group-general,
+.preferences-group-transcription,
+.preferences-group-models,
+.preferences-group-interface { 
+    margin-bottom: 18px;
+    padding: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+}
+
+.preferences-row-autosave,
+.preferences-row-input-device,
+.preferences-row-model,
+.preferences-row-temperature,
+.preferences-row-font-size,
+.preferences-row-colors { 
+    padding: 8px 0;
+    margin-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.preferences-group-general > .preferences-row-autosave { 
+    border-top: none;
+    margin-top: 0;
+}
+
+
+
+
+.dictation-overlay-window {
+    background-color: rgba(48, 48, 48, 0.97); 
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 0; 
+}
+
+.dictation-main-box {
+    padding: 12px; 
+}
+
+.dictation-status-bar {
+     border-top: 1px solid rgba(255, 255, 255, 0.1);
+     padding: 6px 12px; 
+}
+
+
+
+
+
+.levelbar,
+.progressbar-transcription,
+.transcript-progress-bar,
+.preferences-levelbar-input {
+    min-height: 6px;
+    background-color: rgba(255, 255, 255, 0.1); 
+    border-radius: 3px;
+    margin: 3px 0; 
+}
+
+
+.timestamp-label,
+.transcript-segment-timestamp-label,
+.segment-timestamp-label {
+    font-family: monospace;
+    font-size: 10pt; 
+    color: rgba(255, 255, 255, 0.7); 
+}
+
+
+
+.destructive-action,
+.stop-recording-button,
+.transcript-stop-button,
+.transcript-segment-remove-button {
+    color: #FFFFFF; 
+    background-color: #ff6663; 
+    border: 1px solid #E54c38; 
+    padding: 4px 8px; 
+    border-radius: 4px;
+}
+
+.destructive-action:hover,
+.stop-recording-button:hover,
+.transcript-stop-button:hover,
+.transcript-segment-remove-button:hover {
+    background-color: #C01C28; 
+}
+
+
+
+.suggested-action,
+.transcript-segment-copy-button,
+.dictation-copy-button {
+    color: #FFFFFF; 
+    background-color: #92dff3; 
+    border: 1px solid #7ad7f0; 
+    padding: 4px 8px; 
+    border-radius: 4px;
+}
+
+.recordit-action {
+    color: #FFFFFF; 
+    background-color: #ff6663; 
+    border: 1px solid #E54c38; 
+    padding: 4px 8px; 
+    border-radius: 4px;
+
+}
+
+.recordit-action:hover {
+    background-color:#c23a22;
+}
+
+.suggested-action:hover,
+.transcript-segment-copy-button:hover,
+.dictation-copy-button:hover {
+    background-color: #1A5FB4; 
+}
+
+
+.transcript-segment-remove-button,
+.transcript-segment-copy-button {
+    padding: 2px 4px; 
+    min-height: 0;
+    min-width: 0;
+}
+
+
+.boxed-list {
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    padding: 6px;
+    background-color: rgba(245, 245, 245, 0.5); 
+}
+
+
+.reader-popup-window {
+    background-color:rgba(22, 0, 63, 0.753);
+    border-radius: 8px;
+    color:white;
+}
+
+.topbar {
+    background-color:transparent;
+    color:rgb(255, 255, 255);
+}
+.reader-scrolled-window {
+    background-color:transparent;
+}
+
+.reader-text-view {
+    background-color: transparent;
+    font-family:serif;
+    font-size:26px;
+    font-weight:500;
+    color:#f3f3f3;
+    margin-left:40pt;
+    margin-right:40pt;
+
+}

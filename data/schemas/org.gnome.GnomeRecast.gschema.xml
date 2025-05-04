@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <!-- Enum Definitions -->
+  <enum id="org.gnome.GnomeRecast.ModelSize">
+    <value nick='tiny' value='0'/>
+    <value nick='base' value='1'/>
+    <value nick='small' value='2'/>
+    <value nick='medium' value='3'/>
+    <value nick='large' value='4'/>
+  </enum>
+  <enum id="org.gnome.GnomeRecast.ExportFormat">
+    <value nick='txt' value='0'/>
+    <value nick='md' value='1'/>
+    <value nick='srt' value='2'/>
+  </enum>
+  <enum id="org.gnome.GnomeRecast.ThemeMode">
+    <value nick='System' value='0'/>
+    <value nick='Light' value='1'/>
+    <value nick='Dark' value='2'/>
+  </enum>
+
+  <schema id="org.gnome.GnomeRecast" path="/org/gnome/GnomeRecast/">
+    <!-- General Settings -->
+    <key name="autosave-location" type="s">
+      <default>''</default>
+      <summary>Autosave Location</summary>
+      <description>Directory for autosaving transcripts.</description>
+    </key>
+    <key name="auto-launch" type="b">
+      <default>false</default>
+      <summary>Auto Launch</summary>
+      <description>Launch GnomeRecast automatically on login.</description>
+    </key>
+
+    <!-- Microphone Settings -->
+    <key name="mic-input-device" type="s">
+      <default>''</default>
+      <summary>Microphone Input Device</summary>
+      <description>Selected microphone device identifier (placeholder).</description>
+    </key>
+
+    <!-- Transcription Settings -->
+    <key name="default-model" enum="org.gnome.GnomeRecast.ModelSize">
+      <default>'base'</default>
+      <summary>Default Transcription Model</summary>
+      <description>Default Whisper model to use for transcription.</description>
+    </key>
+    <key name="concurrency-limit" type="i">
+      <range min="1" max="8"/>
+      <default>1</default>
+      <summary>Concurrency Limit</summary>
+      <description>Maximum number of concurrent transcription tasks.</description>
+    </key>
+    <key name="temperature" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.0</default>
+      <summary>Whisper Temperature</summary>
+      <description>Whisper temperature setting (0.0 to 1.0).</description>
+    </key>
+    <key name="auto-detect-language" type="b">
+      <default>true</default>
+      <summary>Auto-Detect Language</summary>
+      <description>Automatically detect language if not specified.</description>
+    </key>
+
+<key name="whisper-device-mode" type="s">
+      <default>'auto'</default>
+      <summary>Whisper Device Mode</summary>
+      <description>Selects the device for transcription ('auto', 'cpu', 'cuda'). Auto detects based on availability.</description>
+    </key>
+    <!-- Translation Settings -->
+    <key name="enable-translation" type="b">
+      <default>false</default>
+      <summary>Enable Translation</summary>
+      <description>Enable the translation feature.</description>
+    </key>
+    <key name="target-language" type="s">
+      <default>'en'</default>
+      <summary>Target Translation Language</summary>
+      <description>Target language for translation (e.g., 'es', 'fr').</description>
+    </key>
+    <key name="default-output-format" enum="org.gnome.GnomeRecast.ExportFormat">
+      <default>'txt'</default>
+      <summary>Default Translation Output Format</summary>
+      <description>Default format for exported translations.</description>
+    </key>
+
+    <!-- Appearance Settings -->
+    <key name="theme-mode" enum="org.gnome.GnomeRecast.ThemeMode">
+      <default>'System'</default>
+      <summary>Theme Mode</summary>
+      <description>Application theme mode (System, Light, or Dark).</description>
+    </key>
+    <key name="font-size" type="i">
+      <range min="12" max="24"/>
+      <default>12</default>
+      <summary>Font Size</summary>
+      <description>Interface font size (12 to 24).</description>
+    </key>
+  </schema>
+</schemalist>
