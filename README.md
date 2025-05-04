@@ -2,9 +2,9 @@
 # ReCast
 A desktop application for audio and video transcription on the GNOME desktop.
 
-![<img src="promores/defaultt.png" width="150" />](promores/default.png)
-![<img src="promores/transcriptiont.png" width="150" />](promores/transcription.png)
-![<img src="promores/readert.png" width="150" />](promores/reader.png)
+[<img src="promores/defaultt.png" width="150" />](promores/default.png)
+[<img src="promores/transcriptiont.png" width="150" />](promores/transcription.png)
+[<img src="promores/readert.png" width="150" />](promores/reader.png)
 
 
 ## Core Features
