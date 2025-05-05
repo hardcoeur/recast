@@ -36,7 +36,19 @@ This application is primarily intended for GNOME desktop users who need an effic
 
 ## Getting Started
 
-To run from source (example):
+### Highly experimental flatpak
+
+to install the flatpak from the very experimental beta release:
+```bash
+# download the flatpak
+# run the following command:
+flatpak install --user recast.flatpak
+
+# dependencies:
+org.gnome.Platform branch 47.
+```
+
+### To run from source (example):
 
 ```bash
 # Clone the repository (if applicable)
