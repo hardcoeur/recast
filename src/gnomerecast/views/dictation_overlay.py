@@ -7,7 +7,6 @@ import os
 import concurrent.futures
 from ..audio.capture import AudioCapturer
 from faster_whisper import WhisperModel
-import torch
 
 
 class DictationOverlay(Gtk.Window):
@@ -18,7 +17,7 @@ class DictationOverlay(Gtk.Window):
         super().__init__(**kwargs)
 
         self.add_css_class("dictation-overlay-window")
-        self.settings = Gio.Settings.new("org.gnome.GnomeRecast")
+        self.settings = Gio.Settings.new("org.hardcoeur.Recast")
 
         self.set_title("GnomeRecast Dictation")
         self.set_decorated(False)
@@ -26,7 +25,7 @@ class DictationOverlay(Gtk.Window):
         self.set_default_size(400, 250)
         self.set_resizable(False)
 
-        self.audio_capturer = AudioCapturer(self._on_audio_data_received)
+        self.audio_capturer = AudioCapturer(settings=self.settings, data_callback=self._on_audio_data_received)
         self.audio_buffer = bytearray()
 
         self.sample_rate = 16000
@@ -131,20 +130,20 @@ class DictationOverlay(Gtk.Window):
 
             model = None
             try:
-                if device_mode == "cuda" and torch.cuda.is_available():
+                if device_mode == "cuda":
                     device = "cuda"
                     compute_type = "float16"
                 elif device_mode == "cpu":
                     device = "cpu"
                     compute_type = "int8"
-                else:
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    compute_type = "float16" if device == "cuda" else "int8"
-                print(f"BG Task: Selected device mode: {device_mode}, Determined device: {device}, Compute type: {compute_type}")
+                else:  # 'auto'
+                    device = "auto"
+                    compute_type = "auto"
+                print(f"BG Task: User preferred device mode: {device_mode}, Effective device for WhisperModel: {device}, Compute type: {compute_type}")
 
                 model = WhisperModel(model_to_use, device=device, compute_type=compute_type)
             except Exception as model_load_err:
-                print(f"BG Task: Failed to load faster-whisper model '{model_to_use}': {model_load_err}")
+                print(f"BG Task: Failed to load faster-whisper model '{model_to_use}' with device '{device}' and compute_type '{compute_type}': {model_load_err}")
                 return
 
             try:

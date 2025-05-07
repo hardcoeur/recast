@@ -4,7 +4,6 @@ import os
 import json
 import uuid
 from datetime import datetime
-import torch
 from faster_whisper import WhisperModel
 from faster_whisper.transcribe import TranscriptionOptions
 
@@ -46,7 +45,7 @@ class Transcriber:
 
         try:
             try:
-                settings = Gio.Settings.new("org.gnome.GnomeRecast")
+                settings = Gio.Settings.new("org.hardcoeur.Recast")
                 model_to_use = settings.get_string("default-model")
                 auto_detect = settings.get_boolean("auto-detect-language")
                 lang_to_use = None if auto_detect else settings.get_string("target-language")
@@ -59,16 +58,16 @@ class Transcriber:
                 lang_to_use = None
                 enable_translation = False
 
-            if device_mode == "cuda" and torch.cuda.is_available():
+            if device_mode == "cuda":
                 device = "cuda"
                 compute_type = "float16"
             elif device_mode == "cpu":
                 device = "cpu"
                 compute_type = "int8"
-            else:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                compute_type = "float16" if device == "cuda" else "int8"
-            print(f"Selected device mode: {device_mode}, Determined device: {device}, Compute type: {compute_type}")
+            else:  # 'auto'
+                device = "auto"
+                compute_type = "auto" # faster-whisper will pick the best for the auto-selected device
+            print(f"User preferred device mode: {device_mode}, Effective device for WhisperModel: {device}, Compute type: {compute_type}")
 
             try:
                 model = WhisperModel(model_size_or_path=model_to_use, device=device, compute_type=compute_type)

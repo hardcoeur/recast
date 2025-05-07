@@ -11,20 +11,26 @@ class GnomeRecastApplication(Adw.Application):
     """The main application class for GnomeRecast."""
 
     def __init__(self, **kwargs):
-        super().__init__(application_id="org.gnome.GnomeRecast", **kwargs)
+        super().__init__(application_id="org.hardcoeur.Recast", **kwargs)
 
         self.dictation_overlay = None
         self.preferences_window = None
 
         self.style_manager = Adw.StyleManager.get_default()
 
+        self._perform_settings_migration()
+
 
     def do_startup(self):
         """Called once when the application first starts."""
         Adw.Application.do_startup(self)
+        
+        # Note: Settings migration moved to __init__ to run even earlier,
+        # but can also be here if preferred, as long as it's before settings are heavily used.
+        # self._perform_settings_migration() # Ensure it runs if not in __init__
 
         self.css_provider = Gtk.CssProvider()
-        self.css_provider.load_from_path("data/css/style.css")
+        self.css_provider.load_from_path("/app/share/gnomerecast/css/style.css")
 
         display = Gdk.Display.get_default()
         if display:
@@ -53,7 +59,7 @@ class GnomeRecastApplication(Adw.Application):
         self.set_accels_for_action("app.toggle-dictation", ["<Control><Alt>D"])
 
         builder = Gtk.Builder()
-        builder.add_from_file("data/ui/app-menu.ui")
+        builder.add_from_file("/app/share/gnomerecast/ui/app-menu.ui")
 
         app_menu = builder.get_object("app-menu")
         if not isinstance(app_menu, Gio.MenuModel):
@@ -61,6 +67,39 @@ class GnomeRecastApplication(Adw.Application):
             app_menu = None
 
         self.app_menu = app_menu
+
+    def _perform_settings_migration(self):
+        """Performs one-time migration for microphone settings if needed."""
+        settings = Gio.Settings.new("org.hardcoeur.Recast")
+        
+        new_mic_id_key = "mic-input-device-id"
+        new_follow_default_key = "follow-system-default"
+        old_mic_key = "mic-input-device" # The old key to migrate from
+
+        current_new_mic_id = settings.get_string(new_mic_id_key)
+        current_follow_default = settings.get_boolean(new_follow_default_key)
+        old_mic_value = settings.get_string(old_mic_key)
+
+        # Check if new keys are at their default values and old key has a value
+        # Default for mic-input-device-id is ""
+        # Default for follow-system-default is false
+        if current_new_mic_id == "" and not current_follow_default and old_mic_value != "":
+            print(f"Migrating old microphone setting: '{old_mic_value}'")
+            # If old value was "System Default" or similar, map to new logic
+            # For now, assume old_mic_value was a device ID or a placeholder that implies specific device
+            # If old_mic_value was meant to be a system default, this logic might need refinement.
+            # Based on micrefactor.md, the old key was likely a device string.
+            
+            settings.set_string(new_mic_id_key, old_mic_value)
+            settings.set_boolean(new_follow_default_key, False) # Explicitly not following default
+            
+            # Clear the old key to prevent re-migration
+            print(f"Clearing old microphone setting key '{old_mic_key}'.")
+            settings.set_string(old_mic_key, "") # Or settings.reset_key(old_mic_key) if that's preferred
+            
+            print(f"Migration complete: '{new_mic_id_key}' set to '{old_mic_value}', '{new_follow_default_key}' to False.")
+        else:
+            print("No microphone setting migration needed or already migrated.")
 
 
     def _on_theme_mode_changed(self, settings, key):
@@ -107,7 +146,7 @@ class GnomeRecastApplication(Adw.Application):
     def _on_about_action(self, action, param):
         """Handles the 'about' action."""
         about_window = Adw.AboutWindow(
-            application_name="GnomeRecast",
+            application_name="Recast",
             developer_name="Robert Renling",
             version="0.2.0",
             application_icon="org.hardcoeur.GnomeRecast",

@@ -1,6 +1,5 @@
 PyGObject
 faster-whisper
-torch
 feedparser
 requests
 # Note: GTK4 and its dependencies (like GStreamer) must be installed via the system package manager.

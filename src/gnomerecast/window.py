@@ -32,7 +32,7 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
     def __init__(self, app_menu: Optional[Gio.MenuModel] = None, **kwargs):
         super().__init__(**kwargs)
 
-        self.settings = Gio.Settings.new("org.gnome.GnomeRecast")
+        self.settings = Gio.Settings.new("org.hardcoeur.Recast")
 
         self.set_title("")
         self.set_default_size(800, 600)
@@ -164,9 +164,14 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
 
         self.set_content(main_hbox)
 
-        self._add_sidebar_button("data/icons/compass.png", self.show_initial_view, "Home")
-        self._add_sidebar_button("data/icons/headset.png", self.show_transcript_view, "Transcribe")
-        self._add_sidebar_button("data/icons/history.png", self.show_history_view, "History")
+        # Diagnostic: Try loading 'compass' as a themed icon
+        home_button = Gtk.Button()
+        home_button.set_icon_name("compass-symbolic") # Assuming 'compass-symbolic' is the installed name for compass-symbolic.svg
+        home_button.set_tooltip_text("Home (Themed Icon Test)")
+        home_button.connect("clicked", self.show_initial_view)
+        self.sidebar_vbox.append(home_button)
+        self._add_sidebar_button("/app/data/icons/headset.png", self.show_transcript_view, "Transcribe")
+        self._add_sidebar_button("/app/data/icons/history.png", self.show_history_view, "History")
 
 
         self._create_language_action()
@@ -291,8 +296,8 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         self.recording_audio_buffer.clear()
         try:
             self.recording_audio_capturer = AudioCapturer(
-                self._on_recording_audio_data,
-                source_type="mic"
+                settings=self.settings,
+                data_callback=self._on_recording_audio_data
             )
             self.recording_audio_capturer.start()
             print("GnomeRecastWindow: AudioCapturer started.")
@@ -360,8 +365,10 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         if self.recording_audio_capturer:
             print("GnomeRecastWindow: Stopping audio capture.")
             self.recording_audio_capturer.stop()
+            # Ensure cleanup is called, potentially on idle_add if it involves GLib operations
+            GLib.idle_add(self.recording_audio_capturer.cleanup_on_destroy)
             self.recording_audio_capturer = None
-            print("GnomeRecastWindow: AudioCapturer stopped.")
+            print("GnomeRecastWindow: AudioCapturer stopped and cleanup scheduled.")
         else:
             print("GnomeRecastWindow: No active audio capturer found to stop.")
 
@@ -734,7 +741,7 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         reader_window = Adw.ApplicationWindow(application=self.get_application())
         reader_window.set_title("Reader Mode - Transcript")
         reader_window.set_resizable(True)
-        reader_window.set_default_size(600, 400)
+        reader_window.set_default_size(400, 600)
         reader_window.set_modal(True)
         reader_window.add_css_class("reader-popup-window")
 
