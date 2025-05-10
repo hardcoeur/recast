@@ -2,7 +2,8 @@ import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..models.transcript_item import TranscriptItem, Segment
+    # Ensure this matches the actual SegmentItem class if used, or just TranscriptItem
+    from ..models.transcript_item import TranscriptItem, SegmentItem
 
 def _format_timestamp_srt(seconds: float) -> str:
     """Formats seconds into SRT timestamp HH:MM:SS,ms."""
@@ -24,8 +25,8 @@ def export_to_txt(transcript_item: 'TranscriptItem') -> str:
     if not transcript_item or not transcript_item.segments:
         return ""
 
-    segments = transcript_item.segments
-    return "\n\n".join(segment["text"] for segment in segments if "text" in segment)
+    # Assuming transcript_item.segments is a list of SegmentItem objects
+    return "\n\n".join(segment.text.strip() for segment in transcript_item.segments if hasattr(segment, 'text') and segment.text)
 
 def export_to_md(transcript_item: 'TranscriptItem') -> str:
     """Exports the transcript item to Markdown format."""

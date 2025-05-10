@@ -3,9 +3,16 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, Adw, Gio, Gdk
+import concurrent.futures # Added for I/O thread pool
+import importlib.resources # Added for package-relative paths
+import pathlib # Added for path manipulation
+
 from .window import GnomeRecastWindow
 from .views.dictation_overlay import DictationOverlay
 from .views.preferences_window import PreferencesWindow
+
+# Define the base path for data files within the gnomerecast package
+_GNOMERECAST_DATA_ROOT = importlib.resources.files('gnomerecast') / 'data'
 
 class GnomeRecastApplication(Adw.Application):
     """The main application class for GnomeRecast."""
@@ -15,6 +22,7 @@ class GnomeRecastApplication(Adw.Application):
 
         self.dictation_overlay = None
         self.preferences_window = None
+        self.io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1) # For I/O operations
 
         self.style_manager = Adw.StyleManager.get_default()
 
@@ -30,7 +38,9 @@ class GnomeRecastApplication(Adw.Application):
         # self._perform_settings_migration() # Ensure it runs if not in __init__
 
         self.css_provider = Gtk.CssProvider()
-        self.css_provider.load_from_path("/app/share/gnomerecast/css/style.css")
+        css_resource_ref = _GNOMERECAST_DATA_ROOT / 'css' / 'style.css'
+        with importlib.resources.as_file(css_resource_ref) as css_file_path:
+            self.css_provider.load_from_path(str(css_file_path))
 
         display = Gdk.Display.get_default()
         if display:
@@ -59,7 +69,9 @@ class GnomeRecastApplication(Adw.Application):
         self.set_accels_for_action("app.toggle-dictation", ["<Control><Alt>D"])
 
         builder = Gtk.Builder()
-        builder.add_from_file("/app/share/gnomerecast/ui/app-menu.ui")
+        ui_resource_ref = _GNOMERECAST_DATA_ROOT / 'ui' / 'app-menu.ui'
+        with importlib.resources.as_file(ui_resource_ref) as ui_file_path:
+            builder.add_from_file(str(ui_file_path))
 
         app_menu = builder.get_object("app-menu")
         if not isinstance(app_menu, Gio.MenuModel):
@@ -68,38 +80,138 @@ class GnomeRecastApplication(Adw.Application):
 
         self.app_menu = app_menu
 
+    @staticmethod
+    def _migrate_key(settings: Gio.Settings, old_key_name: str, new_key_name: str, value_mapping: dict, new_key_type: str = "s"):
+        """
+        Helper to migrate a GSettings key.
+        Assumes old key is a string type that needs mapping.
+        New key type can be 's' (string) or other GVariant compatible types.
+        """
+        if not settings.get_property("settings-schema").has_key(old_key_name):
+            print(f"Old GSettings key '{old_key_name}' not in current schema – skipping migration for this key.")
+            return
+        if settings.is_writable(old_key_name):
+            try:
+                # Try to get the old value. If the key doesn't exist or isn't set,
+                # settings.get_string() will raise GLib.Error if the key is not in the schema.
+                old_value_str = settings.get_string(old_key_name)
+
+                if old_value_str and old_value_str in value_mapping:
+                    new_value = value_mapping[old_value_str]
+                    current_new_value = settings.get_string(new_key_name)
+                    default_new_value = settings.get_default_value(new_key_name).get_string()
+
+                    if current_new_value == default_new_value:
+                        print(f"Migrating GSettings key '{old_key_name}' ('{old_value_str}') to '{new_key_name}' with value '{new_value}'.")
+                        if new_key_type == "s":
+                            settings.set_string(new_key_name, new_value)
+                        # Add other types if needed
+                        
+                        print(f"Consider removing or resetting old key '{old_key_name}' if it's no longer used and not in current schema.")
+                        # Example: try resetting, but be cautious as it might error if not in schema
+                        # try:
+                        #     if settings.get_user_value(old_key_name) is not None: # Check if user explicitly set it
+                        #          settings.reset_key(old_key_name)
+                        # except gi.repository.GLib.Error:
+                        #     pass # Key not in schema, cannot reset
+                    elif current_new_value == new_value:
+                        print(f"Old key '{old_key_name}' maps to current value of '{new_key_name}'. No migration needed.")
+                    else:
+                        print(f"New key '{new_key_name}' already has a user-set value ('{current_new_value}'). Skipping migration for '{old_key_name}'.")
+                elif old_value_str: # Old value exists but not in mapping
+                    print(f"Old key '{old_key_name}' has value '{old_value_str}' not in mapping. Skipping migration.")
+                # else: old_value_str is empty (default or not set, and readable)
+                    # print(f"Old key '{old_key_name}' is empty or default. No migration needed.")
+
+            except gi.repository.GLib.Error as e:
+                # This error occurs if get_string fails even if is_writable was true
+                print(f"Error reading GSettings key '{old_key_name}' even though it was writable, skipping migration: {e}")
+            except Exception as e: # Catch any other unexpected errors during migration logic
+                print(f"Unexpected error migrating GSettings key '{old_key_name}': {e}")
+        else:
+            # This means has_key was true, but is_writable was false.
+            print(f"Old GSettings key '{old_key_name}' exists in schema but is not writable, skipping migration.")
+
+
     def _perform_settings_migration(self):
-        """Performs one-time migration for microphone settings if needed."""
+        """Performs one-time settings migrations if needed."""
         settings = Gio.Settings.new("org.hardcoeur.Recast")
         
+        # --- Microphone settings migration (existing) ---
         new_mic_id_key = "mic-input-device-id"
         new_follow_default_key = "follow-system-default"
-        old_mic_key = "mic-input-device" # The old key to migrate from
+        old_mic_key = "mic-input-device"
 
-        current_new_mic_id = settings.get_string(new_mic_id_key)
-        current_follow_default = settings.get_boolean(new_follow_default_key)
-        old_mic_value = settings.get_string(old_mic_key)
+        if settings.get_property("settings-schema").has_key(old_mic_key):
+            # Key exists in schema. Now check if writable and then try to process.
+            if settings.is_writable(old_mic_key):
+                try:
+                    old_mic_value = settings.get_string(old_mic_key) # Try to read the old key's value
 
-        # Check if new keys are at their default values and old key has a value
-        # Default for mic-input-device-id is ""
-        # Default for follow-system-default is false
-        if current_new_mic_id == "" and not current_follow_default and old_mic_value != "":
-            print(f"Migrating old microphone setting: '{old_mic_value}'")
-            # If old value was "System Default" or similar, map to new logic
-            # For now, assume old_mic_value was a device ID or a placeholder that implies specific device
-            # If old_mic_value was meant to be a system default, this logic might need refinement.
-            # Based on micrefactor.md, the old key was likely a device string.
-            
-            settings.set_string(new_mic_id_key, old_mic_value)
-            settings.set_boolean(new_follow_default_key, False) # Explicitly not following default
-            
-            # Clear the old key to prevent re-migration
-            print(f"Clearing old microphone setting key '{old_mic_key}'.")
-            settings.set_string(old_mic_key, "") # Or settings.reset_key(old_mic_key) if that's preferred
-            
-            print(f"Migration complete: '{new_mic_id_key}' set to '{old_mic_value}', '{new_follow_default_key}' to False.")
+                    # If successful, proceed with migration checks
+                    # Check if new keys are at their default values
+                    new_mic_id_is_default = (settings.get_string(new_mic_id_key) == settings.get_default_value(new_mic_id_key).get_string())
+                    new_follow_is_default = (settings.get_boolean(new_follow_default_key) == settings.get_default_value(new_follow_default_key).get_boolean())
+
+                    if new_mic_id_is_default and new_follow_is_default:
+                        # New keys are default. Now check if the old key had a meaningful, non-empty value.
+                        if old_mic_value != "":
+                            print(f"Migrating old microphone setting: '{old_mic_key}' ('{old_mic_value}') to '{new_mic_id_key}' and '{new_follow_default_key}'.")
+                            settings.set_string(new_mic_id_key, old_mic_value)
+                            settings.set_boolean(new_follow_default_key, False)
+                            
+                            print(f"Attempting to clear old microphone setting key '{old_mic_key}'.")
+                            try:
+                                settings.reset_key(old_mic_key)
+                                print(f"Successfully reset old key '{old_mic_key}'.")
+                            except gi.repository.GLib.Error as reset_e:
+                                print(f"Could not reset old key '{old_mic_key}' (it might not be in the current schema or already reset): {reset_e}")
+                            
+                            print(f"Microphone migration complete: '{new_mic_id_key}' set to '{old_mic_value}', '{new_follow_default_key}' to False.")
+                        else:
+                            # Old key was readable but empty.
+                            print(f"No microphone setting migration needed for '{old_mic_key}' (old value was empty).")
+                    else:
+                        # New keys are not at their default values, so migration is not appropriate.
+                        print(f"No microphone setting migration needed for '{old_mic_key}' (new keys '{new_mic_id_key}' or '{new_follow_default_key}' already have user-set values).")
+
+                except gi.repository.GLib.Error as e:
+                    # This error occurs if get_string fails even if is_writable was true
+                    # Or if other GSettings operations fail on an existing, writable key.
+                    print(f"Error processing old GSettings key '{old_mic_key}' even though it's in schema, skipping migration: {e}")
+                except Exception as e: # Catch any other unexpected errors during this specific migration
+                    print(f"Unexpected error during microphone setting migration for '{old_mic_key}': {e}")
+            else:
+                # Key exists in schema but is not writable
+                print(f"Old GSettings key '{old_mic_key}' exists in schema but is not writable, skipping migration.")
         else:
-            print("No microphone setting migration needed or already migrated.")
+            # Key does not exist in schema
+            print(f"Old GSettings key '{old_mic_key}' not found in current schema, skipping migration for this key.")
+
+        # --- Whisper Device Mode Migration ---
+        # Hypothetical old key: "whisper-device" (e.g., an integer enum)
+        # New key: "whisper-device-mode" (string: "auto", "cpu", "cuda")
+        device_mode_mapping = {'0': 'auto', '1': 'cpu', '2': 'cuda'}
+        # Assuming the old key was also a string type for get_string to work,
+        # or it would need a different getter if it was, e.g., an integer.
+        # For this example, we'll assume it was a string '0', '1', '2'.
+        GnomeRecastApplication._migrate_key(settings,
+                                            "whisper-device",
+                                            "whisper-device-mode",
+                                            device_mode_mapping)
+
+        # --- Whisper Compute Type Migration ---
+        # Hypothetical old key: "whisper-compute-precision" (e.g., an integer enum)
+        # New key: "whisper-compute-type" (string: "auto", "int8", "float16")
+        # Note: Schema includes "float32", spec mentions "float32", mapping only has up to float16.
+        # Adding float32 to mapping for completeness if an old key '3' existed.
+        compute_type_mapping = {'0': 'auto', '1': 'int8', '2': 'float16', '3': 'float32'}
+        GnomeRecastApplication._migrate_key(settings,
+                                            "whisper-compute-precision",
+                                            "whisper-compute-type",
+                                            compute_type_mapping)
+        
+        print("Settings migration check complete.")
 
 
     def _on_theme_mode_changed(self, settings, key):
@@ -132,6 +244,16 @@ class GnomeRecastApplication(Adw.Application):
         if not win:
             win = GnomeRecastWindow(application=self, app_menu=self.app_menu)
         win.present()
+
+    def do_shutdown(self):
+        """Called when the application is shutting down."""
+        Adw.Application.do_shutdown(self)
+        if self.io_pool:
+            print("Shutting down I/O thread pool...")
+            self.io_pool.shutdown(wait=True)
+            self.io_pool = None
+            print("I/O thread pool shut down.")
+        # Any other application-specific shutdown tasks can go here
 
     def toggle_dictation_overlay(self):
         """Shows or hides the dictation overlay window."""

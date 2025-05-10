@@ -2,11 +2,16 @@
 <schemalist>
   <!-- Enum Definitions -->
   <enum id="org.hardcoeur.Recast.ModelSize">
-    <value nick='tiny' value='0'/>
-    <value nick='base' value='1'/>
-    <value nick='small' value='2'/>
-    <value nick='medium' value='3'/>
-    <value nick='large' value='4'/>
+    <value nick='tiny.en' value='0'/>
+    <value nick='tiny' value='1'/>
+    <value nick='base.en' value='2'/>
+    <value nick='base' value='3'/>
+    <value nick='small.en' value='4'/>
+    <value nick='small' value='5'/>
+    <value nick='medium.en' value='6'/>
+    <value nick='medium' value='7'/>
+    <value nick='large-v2' value='8'/>
+    <value nick='large-v3' value='9'/>
   </enum>
   <enum id="org.hardcoeur.Recast.ExportFormat">
     <value nick='txt' value='0'/>
@@ -51,7 +56,7 @@
 
     <!-- Transcription Settings -->
     <key name="default-model" enum="org.hardcoeur.Recast.ModelSize">
-      <default>'base'</default>
+      <default>'base'</default> <!-- Keep 'base' as a sensible default -->
       <summary>Default Transcription Model</summary>
       <description>Default Whisper model to use for transcription.</description>
     </key>
@@ -74,9 +79,14 @@
     </key>
 
 <key name="whisper-device-mode" type="s">
-      <default>'cpu'</default>
+      <default>'auto'</default>
       <summary>Whisper Device Mode</summary>
       <description>Selects the device for transcription ('auto', 'cpu', 'cuda'). Auto detects based on availability.</description>
+    </key>
+    <key name="whisper-compute-type" type="s">
+      <default>'auto'</default>
+      <summary>Whisper Compute Type</summary>
+      <description>Selects the compute precision for transcription ('auto', 'int8', 'float16', 'float32'). Auto selects based on device capabilities.</description>
     </key>
     <!-- Translation Settings -->
     <key name="enable-translation" type="b">

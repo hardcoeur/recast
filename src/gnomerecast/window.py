@@ -8,15 +8,24 @@ import wave
 import tempfile
 import os
 import re
+import json # Added for JSON export
+from datetime import datetime # Added for default filenames
+import importlib.resources # Added for package-relative paths
+import pathlib # Added for path manipulation
 
-from typing import Optional
+from typing import Optional, Any
 from .audio.capture import AudioCapturer
 from .views.transcript_view import TranscriptionView
 from .views.initial_view import InitialView
 from .transcription.transcriber import Transcriber
 from .views.history_view import HistoryView
 from .models.transcript_item import TranscriptItem, SegmentItem
+from .utils import export as export_utils # Added
+from .utils.io import atomic_write_json # Added
+from .ui.toast import ToastPresenter # Added for toast framework
 
+# Define the base path for data files within the gnomerecast package
+_GNOMERECAST_DATA_ROOT = importlib.resources.files('gnomerecast') / 'data'
 
 LANGUAGE_MAP = {"auto": "Auto Detect", "en": "English", "es": "Spanish"}
 REVERSE_LANGUAGE_MAP = {v: k for k, v in LANGUAGE_MAP.items()}
@@ -42,6 +51,7 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
 
         self.transcriber = Transcriber()
         self._selected_history_transcript: Optional[TranscriptItem] = None
+        self.last_export_filter_name: Optional[str] = None # Added to store last export filter
 
         self.header_bar = Adw.HeaderBar()
         self.header_bar.add_css_class("window-header-bar")
@@ -107,7 +117,9 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
 
         self.initial_view = InitialView()
         self.transcript_view = TranscriptionView()
-        self.history_view = HistoryView(on_transcript_selected=self._load_transcript_from_history)
+        # Pass the application instance to HistoryView
+        app_instance = self.get_application()
+        self.history_view = HistoryView(application=app_instance, on_transcript_selected=self._load_transcript_from_history)
         self.history_view.connect("transcript-selected", self._on_history_item_selected)
 
 
@@ -141,7 +153,12 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
 
         toolbar_view = Adw.ToolbarView()
         toolbar_view.add_top_bar(self.header_bar)
-        toolbar_view.set_content(self.leaflet)
+
+        # Initialize ToastOverlay and wrap the leaflet
+        self.toast_overlay = Adw.ToastOverlay()
+        self.toast_overlay.set_child(self.leaflet) # Leaflet is the content over which toasts appear
+        toolbar_view.set_content(self.toast_overlay) # ToolbarView now manages the ToastOverlay
+        ToastPresenter.attach(self.toast_overlay) # Register with singleton presenter
 
         main_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
 
@@ -170,13 +187,15 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         home_button.set_tooltip_text("Home (Themed Icon Test)")
         home_button.connect("clicked", self.show_initial_view)
         self.sidebar_vbox.append(home_button)
-        self._add_sidebar_button("/app/data/icons/headset.png", self.show_transcript_view, "Transcribe")
-        self._add_sidebar_button("/app/data/icons/history.png", self.show_history_view, "History")
+        self._add_sidebar_button("icons/headset.png", self.show_transcript_view, "Transcribe")
+        self._add_sidebar_button("icons/history.png", self.show_history_view, "History")
 
 
         self._create_language_action()
         self._create_mode_action()
         self._create_export_action()
+        self._create_save_action()
+        self._create_open_action() # Added
 
         self._update_language_button_label()
         self._update_mode_button_label()
@@ -186,9 +205,13 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         self.settings.connect("changed::default-model", lambda s, k: self._update_mode_button_label())
 
 
-    def _add_sidebar_button(self, icon_path, callback, tooltip_text):
-        """Creates a Gtk.Button with an icon, connects it, and adds it to the sidebar."""
-        icon = Gtk.Picture.new_for_filename(icon_path)
+    def _add_sidebar_button(self, icon_path_str: str, callback, tooltip_text):
+        """Creates a Gtk.Button with an icon, connects it, and adds it to the sidebar.
+        icon_path_str should be relative to _GNOMERECAST_DATA_ROOT (e.g., 'icons/headset.png')
+        """
+        icon_resource_ref = _GNOMERECAST_DATA_ROOT / icon_path_str
+        with importlib.resources.as_file(icon_resource_ref) as icon_file_path:
+            icon = Gtk.Picture.new_for_filename(str(icon_file_path))
         icon.set_content_fit(Gtk.ContentFit.COVER)
         icon.set_can_shrink(False)
         icon.set_size_request(32, 32)
@@ -205,10 +228,20 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         """
         if hasattr(self, 'leaflet') and self.leaflet:
             self.leaflet.set_visible_child_name(view_name)
-            is_transcript_view = (view_name == "transcript")
+            is_transcript_view_active = (view_name == "transcript")
+            
             export_action = self.lookup_action("export-transcript")
             if export_action:
-                export_action.set_enabled(is_transcript_view)
+                # Enable export if transcript view is active AND has content
+                has_content_for_export = hasattr(self.transcript_view, 'has_content') and self.transcript_view.has_content()
+                export_action.set_enabled(is_transcript_view_active and has_content_for_export)
+
+            save_action = self.lookup_action("save-transcript")
+            if save_action:
+                 # Enable save if transcript view is active AND has content
+                has_content_for_save = hasattr(self.transcript_view, 'has_content') and self.transcript_view.has_content()
+                save_action.set_enabled(is_transcript_view_active and has_content_for_save)
+
 
             if hasattr(self, "reader_button"):
                is_history_view = (view_name == "history")
@@ -217,7 +250,7 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
                     self.reader_button.set_sensitive(False)
                     self._selected_history_transcript = None
 
-            print(f"GnomeRecastWindow: Switched active view to '{view_name}'. Export enabled: {is_transcript_view}")
+            print(f"GnomeRecastWindow: Switched active view to '{view_name}'.")
         else:
             print(f"GnomeRecastWindow: Error - Leaflet not found when trying to set active view to '{view_name}'.")
 
@@ -439,12 +472,16 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
             """Callback for transcription progress updates."""
             GLib.idle_add(self.transcript_view.update_progress, fraction, total_segments, completed_segments)
 
-        def on_completion(status: str, transcript_items: list):
-            """Handles transcription completion, cleanup, and final state."""
-            print(f"GnomeRecastWindow: Transcription completed with status: {status}")
+        # Updated on_completion to handle new parameters from transcriber
+        def on_completion(status: str, transcript_segments: list, saved_json_path: Optional[str], save_error_message: Optional[str]):
+            """Handles transcription completion, cleanup, and final state, including save status."""
+            print(f"GnomeRecastWindow: Transcription process finished. Status: {status}, Saved JSON: {saved_json_path}, Save Error: {save_error_message}")
 
-            if cleanup_paths and status == 'completed':
-                print(f"GnomeRecastWindow: Transcription successful. Attempting cleanup for: {cleanup_paths}")
+            # Determine primary success based on transcription itself
+            transcription_successful = status == 'completed' or status == 'completed_save_failed'
+
+            if cleanup_paths and transcription_successful: # Cleanup if transcription part was okay
+                print(f"GnomeRecastWindow: Transcription part successful. Attempting cleanup for: {cleanup_paths}")
                 for path in cleanup_paths:
                     try:
                         if os.path.exists(path):
@@ -457,14 +494,41 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
             elif cleanup_paths:
                 print(f"GnomeRecastWindow: Transcription status was '{status}'. Skipping cleanup for: {cleanup_paths}")
 
-            if status != 'completed' or not transcript_items:
-                print(f"GnomeRecastWindow: Transcription failed or produced no items. Returning to initial view.")
+            if status == 'completed': # Transcription and save successful
+                toast_message = f"Saved ✓ {os.path.basename(saved_json_path)}" if saved_json_path else "Transcription complete, save path unknown."
+                ToastPresenter.show(self, toast_message)
+                GLib.idle_add(self.history_view.refresh_list)
+                print(f"GnomeRecastWindow: Transcription and save successful. Segments added in real-time. History refreshed.")
+            elif status == 'completed_save_failed':
+                base_filename = os.path.basename(cleanup_paths[0]) if cleanup_paths else "transcript" # Get a filename for the toast
+                toast_message = f"❌ Could not save {base_filename}: {save_error_message or 'Unknown error'}"
+                ToastPresenter.show(self, toast_message)
+                # Transcription itself was okay, segments might be in view, but not persisted.
+                # Decide if history should be refreshed if a .tmp file might exist or if it's an overwrite fail.
+                # For now, let's not refresh history if save failed, to avoid showing a non-existent item.
+                print(f"GnomeRecastWindow: Transcription successful, but save failed. Segments might be in view.")
+            elif status == 'error':
+                toast_message = f"❌ Transcription failed: {save_error_message or 'Unknown error'}"
+                ToastPresenter.show(self, toast_message)
+                print(f"GnomeRecastWindow: Transcription failed. Error: {save_error_message}")
                 if hasattr(self, 'initial_view') and self.initial_view:
                     GLib.idle_add(self.initial_view.reset_button_state)
                 GLib.idle_add(self.show_initial_view)
-            else:
-                print(f"GnomeRecastWindow: Transcription successful. Segments were added in real-time.")
-                GLib.idle_add(self.history_view.refresh_list)
+            elif status == 'cancelled':
+                ToastPresenter.show(self, "Transcription cancelled.")
+                print(f"GnomeRecastWindow: Transcription cancelled by user.")
+                # Optionally, revert to initial view or leave as is
+                if hasattr(self, 'initial_view') and self.initial_view:
+                    GLib.idle_add(self.initial_view.reset_button_state)
+                GLib.idle_add(self.show_initial_view) # Or stay on transcript view if partially filled
+            elif status == 'no_files':
+                ToastPresenter.show(self, "No files selected for transcription.")
+            else: # Other unexpected statuses
+                ToastPresenter.show(self, f"Transcription finished with status: {status}")
+                if hasattr(self, 'initial_view') and self.initial_view:
+                    GLib.idle_add(self.initial_view.reset_button_state)
+                GLib.idle_add(self.show_initial_view)
+
 
         self.transcriber.start_transcription(
             file_paths=file_paths,
@@ -483,7 +547,15 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
             if file_path:
                 print(f"GnomeRecastWindow: File dropped: {file_path}")
                 if os.path.exists(file_path) and os.path.isfile(file_path):
-                    self._start_transcription_process([file_path])
+                    if file_path.lower().endswith(".json"):
+                        print(f"Attempting to import (drag & drop) JSON transcript: {file_path}")
+                        self._import_transcript_file(file_path) # Use the new import handler
+                    else:
+                        # Assume it's an audio/video file for transcription
+                        print(f"Attempting to transcribe (drag & drop) media file: {file_path}")
+                        self.transcript_view.reset_view()
+                        self._set_active_view("transcript")
+                        self._start_transcription_process([file_path], cleanup_paths=[])
                     return True
                 else:
                     print(f"GnomeRecastWindow: Dropped path is not a valid file: {file_path}")
@@ -521,16 +593,46 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         """Creates and adds a simple action for exporting the transcript."""
         action = Gio.SimpleAction.new("export-transcript", None)
         action.connect("activate", self._on_export_transcript)
-        action.set_enabled(False)
+        action.set_enabled(False) # Initially disabled, enabled when transcript view is active
         self.add_action(action)
         print("Action 'win.export-transcript' created.")
+
+    def _create_save_action(self):
+        """Creates and adds a simple action for saving the current transcript."""
+        action = Gio.SimpleAction.new("save-transcript", None)
+        action.connect("activate", self._on_save_transcript)
+        # Sensitivity will be managed based on transcript_view content
+        # For now, let's assume it's enabled if transcript_view has content.
+        # This will be checked in _on_save_transcript or by a separate update method.
+        action.set_enabled(False) # Start disabled, enable when content is available
+        self.add_action(action)
+        # Accelerators for window actions are set on the application
+        app = self.get_application()
+        if app:
+            app.set_accels_for_action("win.save-transcript", ["<Control>s"])
+        print("Action 'win.save-transcript' (Ctrl+S) created.")
+
+    def _create_open_action(self):
+        """Creates and adds a simple action for opening a transcript or media file."""
+        action = Gio.SimpleAction.new("open-file", None)
+        action.connect("activate", self._on_open_file_activate)
+        self.add_action(action)
+        app = self.get_application()
+        if app:
+            # Using "win.open-file" to be consistent with other window actions if it's window-specific.
+            # If it's a global app action that could be triggered without the window, "app.open-file" is fine.
+            # Let's assume it's tied to this window's context for now.
+            app.set_accels_for_action("win.open-file", ["<Control>o"])
+        print("Action 'win.open-file' (Ctrl+O) created.")
+
 
     def _on_history_item_selected(self, history_view, transcript_item):
         """Updates UI when a transcript item is selected in history view."""
         print(f"Transcript selected: {transcript_item.output_filename}")
         self._selected_history_transcript = transcript_item
         if hasattr(self, 'reader_button'):
-            self.reader_button.set_sensitive(True)
+            # Enable reader button only if the selected item has segments
+            self.reader_button.set_sensitive(bool(transcript_item and transcript_item.segments))
 
     def _on_select_mode(self, action, value):
         """Handles state change for the mode selection action."""
@@ -598,118 +700,568 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         """Handles the 'activate' signal for the 'export-transcript' action."""
         print("Export Transcript action activated.")
 
-        if not hasattr(self, 'transcript_view') or not self.transcript_view:
-            print("Error: TranscriptView not available.")
+        if not (hasattr(self, 'transcript_view') and self.transcript_view and
+                hasattr(self.transcript_view, 'has_content') and self.transcript_view.has_content()):
+            ToastPresenter.show(self, "Nothing to export.")
+            print("Export action: No active transcript content to export.")
             return
 
-        try:
-            transcript_text = self.transcript_view.get_full_text()
-        except AttributeError:
-             print("Error: TranscriptionView does not have a 'get_full_text' method.")
-             return
-        except Exception as e:
-            print(f"Error getting transcript text: {e}")
-            return
+        current_item = self.transcript_view.get_current_item()
+        if not current_item:
+            # Fallback: try to construct a temporary item from view data if no item is formally loaded
+            # This case should be less common if transcription/load always sets current_item.
+            # For now, we require a current_item to get metadata like output_filename_base.
+             view_data = self.transcript_view.get_transcript_data_for_saving()
+             if not view_data or not view_data.get("segments"):
+                ToastPresenter.show(self, "No transcript data available to export.")
+                return
+            # Create a temporary TranscriptItem for export if one isn't set.
+            # This is a simplified approach.
+             current_item = TranscriptItem(
+                source_path="", # No source path for an unsaved item
+                transcript_text=view_data.get("text", ""),
+                segments=[SegmentItem(**s) for s in view_data.get("segments", [])], # Reconstruct SegmentItem objects
+                language=view_data.get("language", "en")
+            )
+             current_item.output_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_export"
 
-        if not transcript_text:
-            print("No transcript text available to export.")
-            return
 
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Export Transcript As...")
 
+        # Define file filters
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        
+        txt_filter = Gtk.FileFilter(); txt_filter.set_name("Plain Text (*.txt)"); txt_filter.add_pattern("*.txt")
+        filters.append(txt_filter)
+        
+        md_filter = Gtk.FileFilter(); md_filter.set_name("Markdown (*.md)"); md_filter.add_pattern("*.md")
+        filters.append(md_filter)
+        
+        srt_filter = Gtk.FileFilter(); srt_filter.set_name("SubRip Subtitle (*.srt)"); srt_filter.add_pattern("*.srt")
+        filters.append(srt_filter)
+        
+        json_filter = Gtk.FileFilter(); json_filter.set_name("JSON Transcript (*.json)"); json_filter.add_pattern("*.json")
+        filters.append(json_filter)
+        
+        dialog.set_filters(filters)
 
-        print("Showing file save dialog...")
-        dialog.save(self, None, self._on_transcript_file_selected, transcript_text)
+        # Pre-select last used filter
+        if self.last_export_filter_name:
+            for i in range(filters.get_n_items()):
+                f = filters.get_item(i)
+                if f.get_name() == self.last_export_filter_name:
+                    dialog.set_default_filter(f)
+                    break
+        else:
+            dialog.set_default_filter(txt_filter) # Default to TXT if no previous
+
+        # Default filename
+        base_name = os.path.splitext(current_item.output_filename)[0] if current_item.output_filename else "transcript"
+        # Initial extension will be set by the dialog based on the selected filter if possible,
+        # but Gtk.FileDialog does not directly use the filter for the initial name's extension.
+        # We'll adjust it in the callback. For now, just set a base name.
+        dialog.set_initial_name(base_name) # e.g., "YYYYMMDD_HHMMSS_new" or "transcript_export"
+
+        print("Showing file export dialog...")
+        dialog.save(self, None, self._on_export_dialog_finish, current_item)
 
 
-    def _on_transcript_file_selected(self, dialog, result, transcript_text):
-        """Callback executed after the user selects a file in the save dialog."""
-        print("File save dialog finished.")
+    def _on_export_dialog_finish(self, dialog, result, transcript_item: TranscriptItem):
+        """Callback executed after the user selects a file in the export dialog."""
         try:
-            file = dialog.save_finish(result)
-            if file is not None:
-                path = file.get_path()
-                print(f"Attempting to save transcript to: {path}")
-                try:
-                    with open(path, "w", encoding='utf-8') as f:
-                        f.write(transcript_text)
-                    print(f"Transcript successfully saved to {path}")
-                except Exception as e:
-                    print(f"Error writing transcript to file {path}: {e}")
-                    error_dialog = Gtk.MessageDialog(
-                        transient_for=self,
-                        modal=True,
-                        message_type=Gtk.MessageType.ERROR,
-                        buttons=Gtk.ButtonsType.CLOSE,
-                        text="Error Saving File",
-                        secondary_text=f"Could not write transcript to '{os.path.basename(path)}':\n{e}"
-                    )
-                    error_dialog.connect("response", lambda d, r: d.destroy())
-                    error_dialog.show()
-            else:
-                print("File save operation cancelled by user.")
+            gfile: Optional[Gio.File] = dialog.save_finish(result)
+            if gfile:
+                target_path = gfile.get_path()
+                if not target_path:
+                    ToastPresenter.show(self, "❌ Invalid export path selected.")
+                    return
 
+                selected_filter = dialog.get_filter()
+                if selected_filter:
+                    self.last_export_filter_name = selected_filter.get_name()
+                
+                # Determine export format based on filename extension or selected filter
+                # Gtk.FileDialog doesn't always enforce the extension from the filter on the Gio.File,
+                # so checking the path is more reliable.
+                file_ext = os.path.splitext(target_path)[1].lower()
+                
+                export_format = None
+                if file_ext == ".txt":
+                    export_format = "txt"
+                elif file_ext == ".md":
+                    export_format = "md"
+                elif file_ext == ".srt":
+                    export_format = "srt"
+                elif file_ext == ".json":
+                    export_format = "json"
+                else:
+                    # Fallback if extension is missing or unknown, try to infer from filter name
+                    if self.last_export_filter_name:
+                        if "Plain Text" in self.last_export_filter_name: export_format = "txt"; target_path += ".txt"
+                        elif "Markdown" in self.last_export_filter_name: export_format = "md"; target_path += ".md"
+                        elif "SubRip" in self.last_export_filter_name: export_format = "srt"; target_path += ".srt"
+                        elif "JSON" in self.last_export_filter_name: export_format = "json"; target_path += ".json"
+                
+                if not export_format:
+                    ToastPresenter.show(self, "❌ Unknown export format. Please select a filter or use a known extension.")
+                    return
+
+                print(f"Attempting to export transcript to: {target_path} as {export_format}")
+
+                app = self.get_application()
+                if not app or not hasattr(app, 'io_pool') or not app.io_pool:
+                    ToastPresenter.show(self, "❌ Export failed: Thread pool error.")
+                    return
+
+                def export_io_operation():
+                    try:
+                        content_to_write: Any = ""
+                        is_binary_write = False
+
+                        if export_format == "txt":
+                            content_to_write = export_utils.export_to_txt(transcript_item)
+                        elif export_format == "md":
+                            content_to_write = export_utils.export_to_md(transcript_item)
+                        elif export_format == "srt":
+                            content_to_write = export_utils.export_to_srt(transcript_item)
+                        elif export_format == "json":
+                            # Use the TranscriptItem's to_dict method for spec-compliant JSON
+                            content_to_write = transcript_item.to_dict()
+                            # atomic_write_json handles json.dump internally
+                            atomic_write_json(content_to_write, target_path)
+                            ToastPresenter.show(self, f"Exported ✓ {os.path.basename(target_path)}")
+                            return # atomic_write_json handles writing
+
+                        # For text-based formats
+                        with open(target_path, "w", encoding='utf-8') as f:
+                            f.write(content_to_write)
+                        
+                        ToastPresenter.show(self, f"Exported ✓ {os.path.basename(target_path)}")
+
+                    except Exception as e_io:
+                        print(f"Error during export I/O to {target_path}: {e_io}")
+                        ToastPresenter.show(self, f"❌ Export failed: {e_io}")
+                
+                app.io_pool.submit(export_io_operation)
+
+            else: # User cancelled
+                print("Export operation cancelled by user.")
+                # No toast for cancellation typically
         except GLib.Error as e:
             if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
-                 print("File save operation cancelled by user (GLib.Error).")
+                print("Export operation cancelled by user (GLib.Error).")
             else:
-                 print(f"GLib error during file save: {e}")
-                 error_dialog = Gtk.MessageDialog(
-                     transient_for=self,
-                     modal=True,
-                     message_type=Gtk.MessageType.ERROR,
-                     buttons=Gtk.ButtonsType.CLOSE,
-                     text="Error Saving File",
-                     secondary_text=f"An error occurred during the save operation:\n{e}"
-                 )
-                 error_dialog.connect("response", lambda d, r: d.destroy())
-                 error_dialog.show()
+                print(f"GLib error during export dialog: {e}")
+                ToastPresenter.show(self, f"❌ Export error: {e.code.value_nick}")
+        except Exception as e_main:
+            print(f"Unexpected error during export dialog callback: {e_main}")
+            ToastPresenter.show(self, f"❌ Unexpected export error.")
 
 
     def _load_transcript_from_history(self, transcript_item: TranscriptItem):
-        """Loads segments from a selected history item into the transcript view."""
+        """
+        Loads a TranscriptItem (selected from history) into the transcript view.
+        Uses TranscriptView.load_transcript() directly.
+        """
         if not transcript_item:
-            print("Error: _load_transcript_from_history called with None item.")
+            print("Error: _load_transcript_from_history (double-click handler) called with None item.")
             if hasattr(self, 'reader_button'):
                 self.reader_button.set_sensitive(False)
             self._selected_history_transcript = None
             return
+        
+        print(f"GnomeRecastWindow: _load_transcript_from_history called for item: {transcript_item.uuid if transcript_item else 'None'}")
 
-        self._selected_history_transcript = transcript_item
+        self._selected_history_transcript = transcript_item # Keep track of selected item for Reader button etc.
         if hasattr(self, 'reader_button'):
-            self.reader_button.set_sensitive(True)
-            print(f"Reader button enabled for item {transcript_item.uuid}")
+            self.reader_button.set_sensitive(bool(transcript_item.segments)) # Enable reader if segments exist
+            print(f"Reader button sensitivity set for item {transcript_item.uuid}")
 
-        segment_dicts = []
-        if transcript_item.segments:
-            print(f"Processing {len(transcript_item.segments)} segments from history item {transcript_item.uuid}...")
-            for i, seg in enumerate(transcript_item.segments):
-                if isinstance(seg, SegmentItem):
-                    segment_dicts.append({
-                        "id": i,
-                        "start": seg.start,
-                        "end": seg.end,
-                        "text": seg.text,
-                        "start_ms": int(seg.start * 1000),
-                        "end_ms": int(seg.end * 1000)
-                    })
-                else:
-                    print(f"Warning: Segment {i} in history item {transcript_item.uuid} is not a SegmentItem instance (type: {type(seg)}).")
-        else:
-            print(f"Warning: History item {transcript_item.uuid} has no segments attribute or it's empty.")
-
-        print(f"Loading {len(segment_dicts)} processed segments from history...")
         if not hasattr(self, 'transcript_view') or not self.transcript_view:
             print("Error: TranscriptView not available to load history.")
             return
 
-        GLib.idle_add(self.transcript_view.reset_view)
-
-        for segment_dict in segment_dicts:
-            GLib.idle_add(self.transcript_view.add_segment, segment_dict)
-
+        print(f"GnomeRecastWindow: Queuing transcript_view.load_transcript for history item {transcript_item.uuid}")
+        # The load_transcript method in TranscriptView now handles resetting and adding segments.
+        GLib.idle_add(self.transcript_view.load_transcript, transcript_item)
+        # Ensure _set_active_view is also called via idle_add to run on the main thread after load_transcript might have started
         GLib.idle_add(self._set_active_view, "transcript")
+        print(f"GnomeRecastWindow: _load_transcript_from_history completed for {transcript_item.uuid}")
+
+    def _on_open_file_activate(self, action, param):
+        """Handles activation of the 'open-file' action (e.g., Ctrl+O or menu)."""
+        print("Open File action activated.")
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Open Transcript or Media File")
+        # dialog.set_accept_label("Open") # Already default
+
+        # Create filters
+        json_filter = Gtk.FileFilter()
+        json_filter.set_name("Transcript Files (*.json)")
+        json_filter.add_mime_type("application/json")
+        json_filter.add_pattern("*.json")
+
+        # Common audio formats (extend as needed)
+        audio_video_filter = Gtk.FileFilter()
+        audio_video_filter.set_name("Audio/Video Files")
+        # General types
+        audio_video_filter.add_mime_type("audio/*")
+        audio_video_filter.add_mime_type("video/*")
+        # Specific common patterns (examples)
+        audio_video_filter.add_pattern("*.mp3")
+        audio_video_filter.add_pattern("*.wav")
+        audio_video_filter.add_pattern("*.ogg")
+        audio_video_filter.add_pattern("*.flac")
+        audio_video_filter.add_pattern("*.mp4")
+        audio_video_filter.add_pattern("*.mkv")
+        audio_video_filter.add_pattern("*.mov")
+        audio_video_filter.add_pattern("*.webm")
+
+
+        all_supported_filter = Gtk.FileFilter()
+        all_supported_filter.set_name("All Supported Files")
+        all_supported_filter.add_filter(json_filter)
+        all_supported_filter.add_filter(audio_video_filter)
+
+
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(all_supported_filter) # Add combined filter first
+        filters.append(json_filter)
+        filters.append(audio_video_filter)
+        
+        dialog.set_filters(filters)
+        dialog.set_default_filter(all_supported_filter) # Default to showing all supported
+
+        # Set initial folder (optional, e.g., user's documents or last used)
+        # For now, let it default or use a standard location like home or documents
+        # default_folder = Gio.File.new_for_path(os.path.expanduser("~"))
+        # dialog.set_initial_folder(default_folder)
+
+        dialog.open(self, None, self._on_open_file_dialog_finish)
+
+    def _on_open_file_dialog_finish(self, dialog, result):
+        """Callback for Gtk.FileDialog.open()."""
+        try:
+            file: Optional[Gio.File] = dialog.open_finish(result)
+            if file:
+                file_path = file.get_path()
+                if not file_path or not os.path.isfile(file_path):
+                    ToastPresenter.show(self, f"❌ Invalid file selected.")
+                    print(f"Open dialog: Invalid file path received: {file_path}")
+                    return
+
+                print(f"File selected for opening: {file_path}")
+                
+                # Check file extension to decide action
+                if file_path.lower().endswith(".json"):
+                    print(f"Attempting to import JSON transcript: {file_path}")
+                    # This will call the import pipeline defined in Phase 4
+                    self._import_transcript_file(file_path) # This method needs to be created
+                else:
+                    # Assume it's an audio/video file for transcription
+                    print(f"Attempting to transcribe media file: {file_path}")
+                    self.transcript_view.reset_view() # Reset view before starting new transcription
+                    self._set_active_view("transcript")
+                    # The _start_transcription_process method handles its own threading for transcription
+                    self._start_transcription_process([file_path], cleanup_paths=[]) # No cleanup for user-opened files
+            else:
+                print("Open file operation cancelled by user.")
+                # No toast needed for cancellation usually
+        except GLib.Error as e:
+            if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                print("Open file operation cancelled by user (GLib.Error).")
+            else:
+                print(f"GLib error during file open dialog: {e}")
+                ToastPresenter.show(self, f"❌ Error opening file: {e.code.value_nick}")
+        except Exception as e:
+            print(f"Unexpected error during file open dialog callback: {e}")
+            ToastPresenter.show(self, f"❌ Unexpected error opening file.")
+
+
+    def _import_transcript_file(self, json_file_path: str):
+        """
+        Handles the import of an external JSON transcript file.
+        This implements Phase 4 of the plan.
+        """
+        app = self.get_application()
+        if not app or not hasattr(app, 'io_pool') or not app.io_pool:
+            ToastPresenter.show(self, "❌ Import failed: Thread pool error.")
+            return
+
+        def import_operation():
+            try:
+                # 1. Validation (using TranscriptItem.load_from_json which now does strict validation)
+                print(f"Import operation: Validating {json_file_path}")
+                loaded_item = TranscriptItem.load_from_json(json_file_path)
+                
+                transcripts_dir = os.path.join(GLib.get_user_data_dir(), 'GnomeRecast', 'transcripts')
+                os.makedirs(transcripts_dir, exist_ok=True)
+                
+                original_basename = os.path.splitext(os.path.basename(json_file_path))[0]
+                new_timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                uuid_collision = False
+                colliding_file_path = None
+                # Basic UUID collision check (can be improved for performance on many files)
+                for entry in os.scandir(transcripts_dir):
+                    if entry.is_file() and entry.name.lower().endswith(".json"):
+                        try:
+                            temp_existing_item = TranscriptItem.load_from_json(os.path.join(transcripts_dir, entry.name))
+                            if temp_existing_item.uuid == loaded_item.uuid:
+                                uuid_collision = True
+                                colliding_file_path = os.path.join(transcripts_dir, entry.name)
+                                break
+                        except Exception: # Ignore errors in existing files for this check
+                            continue
+                
+                action_taken = "copy" # Default action
+                if uuid_collision:
+                    # Simplified: default to "keep_both" to avoid complex synchronous dialog from worker thread
+                    print(f"UUID {loaded_item.uuid} collision with {colliding_file_path}. Defaulting to 'Keep Both'.")
+                    action_taken = "keep_both"
+
+                data_to_write = loaded_item.to_dict()
+
+                if action_taken == "keep_both":
+                    data_to_write['uuid'] = str(uuid.uuid4())
+                    data_to_write['timestamp'] = new_timestamp_str
+                    target_filename = f"{new_timestamp_str}_{original_basename}.json"
+                    data_to_write['output_filename'] = target_filename
+                elif action_taken == "replace" and colliding_file_path: # This case is less likely with current simplified logic
+                    target_filename = os.path.basename(colliding_file_path)
+                    data_to_write['output_filename'] = target_filename
+                else: # Default "copy" behavior
+                    target_filename = f"{new_timestamp_str}_{original_basename}.json"
+                    # If not a collision, or if collision but we're not replacing,
+                    # we might still want to update timestamp if it's a "copy new"
+                    # For simplicity now, if it's a plain copy (no collision), use original item's timestamp for filename
+                    # if not uuid_collision:
+                    #    target_filename = f"{loaded_item.timestamp}_{original_basename}.json" # Needs YYYYMMDD_HHMMSS
+                    # else (it's a non-colliding copy, or "copy" was chosen for some other reason)
+                    data_to_write['timestamp'] = new_timestamp_str # Ensure new timestamp for new file name
+                    data_to_write['output_filename'] = target_filename
+
+
+                target_path = os.path.join(transcripts_dir, target_filename)
+                atomic_write_json(data_to_write, target_path)
+                
+                ToastPresenter.show(self, f"Imported ✓ {os.path.basename(target_path)}")
+                GLib.idle_add(self.history_view.refresh_list)
+                
+                final_item_to_load = TranscriptItem.load_from_json(target_path)
+                GLib.idle_add(self.transcript_view.load_transcript, final_item_to_load)
+                GLib.idle_add(self._set_active_view, "transcript")
+
+            except Exception as e: # Catch-all for the import operation
+                if isinstance(e, ValueError):
+                    print(f"Import failed: Validation error - {e}")
+                    GLib.idle_add(self._show_modal_message, "Invalid Transcript File", f"The file '{os.path.basename(json_file_path)}' is not a valid transcript file or is malformed.\n\nDetails: {e}")
+                elif isinstance(e, FileNotFoundError):
+                    print(f"Import failed: File not found - {e}")
+                    GLib.idle_add(self._show_modal_message, "Import Error", f"File not found: {json_file_path}")
+                elif isinstance(e, json.JSONDecodeError):
+                    print(f"Import failed: JSON decode error - {e}")
+                    GLib.idle_add(self._show_modal_message, "Import Error", f"Could not decode JSON from: {os.path.basename(json_file_path)}")
+                else:
+                    print(f"Import failed: Unexpected error - {e}", exc_info=True)
+                    GLib.idle_add(self._show_modal_message, "Import Error", f"An unexpected error occurred while importing '{os.path.basename(json_file_path)}'.\nDetails: {str(e)[:100]}")
+        # End of import_operation function definition
+
+        # This call should be part of _import_transcript_file, after import_operation is defined.
+        # Corrected indentation to 8 spaces (relative to class indent of 4).
+        app.io_pool.submit(import_operation)
+
+    def _show_modal_message(self, title: str, message: str, secondary_text: Optional[str] = None, msg_type: Gtk.MessageType = Gtk.MessageType.ERROR):
+        """Displays a modal Gtk.MessageDialog."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=msg_type,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=title,
+        )
+        if secondary_text:
+            dialog.props.secondary_text = secondary_text
+        dialog.connect("response", lambda d, r: d.destroy())
+        dialog.present()
+
+
+    def _on_save_transcript(self, action, param):
+        """Handles the 'activate' signal for the 'save-transcript' action."""
+        print("Save Transcript action activated (Ctrl+S).")
+        # Check if transcript_view is active and has content
+        if not (self.leaflet.get_visible_child_name() == "transcript" and
+                hasattr(self.transcript_view, 'has_content') and
+                self.transcript_view.has_content()):
+            ToastPresenter.show(self, "Nothing to save.")
+            print("Save action: No active transcript content to save.")
+            return
+
+        current_transcript_data = self.transcript_view.get_transcript_data_for_saving()
+        if not current_transcript_data:
+            ToastPresenter.show(self, "Could not retrieve transcript data to save.")
+            return
+
+        # If the current transcript came from history (_selected_history_transcript is set AND its source_path exists)
+        # and it's currently loaded in the view (e.g. check if transcript_view's current item matches)
+        # This logic needs to be robust: how do we know if transcript_view is displaying _selected_history_transcript?
+        # For now, let's assume if _selected_history_transcript exists and its source_path is valid, we try to overwrite.
+        # A more robust way would be for transcript_view to hold the TranscriptItem it's displaying.
+        
+        # Simplification: if self.transcript_view.current_item is not None and self.transcript_view.current_item.source_path:
+        # This assumes transcript_view has a 'current_item' property that holds the loaded TranscriptItem.
+        # This needs to be implemented in TranscriptView.load_transcript().
+        
+        target_item_for_save = self.transcript_view.get_current_item() # Needs implementation in TranscriptView
+
+        if target_item_for_save and target_item_for_save.source_path and os.path.exists(target_item_for_save.source_path):
+            # Overwrite existing file
+            print(f"Attempting to overwrite existing transcript: {target_item_for_save.source_path}")
+            try:
+                # Update the target_item_for_save with data from current_transcript_data if necessary,
+                # then call target_item_for_save.save() or directly use atomic_write_json.
+                # For now, let's re-create the dict to ensure it's current.
+                # This assumes current_transcript_data is a full dict matching TranscriptItem.to_dict()
+                # This part needs careful handling of what current_transcript_data provides.
+                # Ideally, we get a full TranscriptItem-like dict from the view.
+                
+                # Let's assume current_transcript_data is a dict ready for atomic_write_json
+                # and contains all necessary fields (uuid, timestamp, segments, etc.)
+                # If it's a new transcript that was loaded from an old one, it should retain original UUID and timestamp unless explicitly changed.
+                
+                # The TranscriptItem.save() method is better here if the view holds a full TranscriptItem.
+                # For now, directly using atomic_write_json with data from view.
+                
+                # Construct the full dictionary to save, ensuring all fields from spec §1.1 are present.
+                # This might involve merging view data with existing item data if it's an overwrite.
+                
+                # Simplest path for now: assume current_transcript_data IS the complete data to save.
+                # This requires transcript_view.get_transcript_data_for_saving() to be comprehensive.
+                
+                # Get the application's I/O pool
+                app = self.get_application()
+                if not app or not hasattr(app, 'io_pool') or not app.io_pool:
+                    print("Error: I/O thread pool not available on application object.")
+                    ToastPresenter.show(self, "❌ Save failed: Thread pool error.")
+                    return
+
+                def save_operation():
+                    try:
+                        # Ensure all required fields are in current_transcript_data
+                        # This is crucial for meeting the spec.
+                        # Example: ensure 'language', 'source_path' (media), 'audio_source_path' (media) are there.
+                        # If current_transcript_data doesn't have them, fetch from target_item_for_save.
+                        data_to_save = {
+                            "uuid": target_item_for_save.uuid,
+                            "timestamp": datetime.strptime(target_item_for_save.timestamp, "%Y-%m-%d %H:%M:%S").strftime("%Y%m%d_%H%M%S"), # Convert to JSON format
+                            "text": current_transcript_data.get("text", target_item_for_save.transcript_text),
+                            "segments": current_transcript_data.get("segments", target_item_for_save.to_segment_dicts()),
+                            "language": current_transcript_data.get("language", target_item_for_save.language),
+                            "source_path": target_item_for_save.audio_source_path, # Media path
+                            "audio_source_path": target_item_for_save.audio_source_path, # Media path
+                            "output_filename": target_item_for_save.output_filename
+                        }
+
+                        atomic_write_json(data_to_save, target_item_for_save.source_path)
+                        ToastPresenter.show(self, f"Saved ✓ {os.path.basename(target_item_for_save.source_path)}")
+                        GLib.idle_add(self.history_view.refresh_list) # Refresh history as content changed
+                    except Exception as e:
+                        print(f"Error saving (overwrite) to {target_item_for_save.source_path}: {e}")
+                        ToastPresenter.show(self, f"❌ Could not save {os.path.basename(target_item_for_save.source_path)}: {e}")
+
+                app.io_pool.submit(save_operation)
+
+            except Exception as e: # Catch errors before submitting to thread pool
+                print(f"Error preparing to save (overwrite) {target_item_for_save.source_path}: {e}")
+                ToastPresenter.show(self, f"❌ Save error: {e}")
+
+        else:
+            # New, unsaved session: Prompt with Gtk.FileDialog.save()
+            print("New transcript session. Prompting for save location.")
+            dialog = Gtk.FileDialog.new()
+            dialog.set_title("Save Transcript As...")
+            
+            # Default directory and filename
+            default_folder_path = os.path.join(GLib.get_user_data_dir(), 'GnomeRecast', 'transcripts')
+            os.makedirs(default_folder_path, exist_ok=True)
+            default_folder = Gio.File.new_for_path(default_folder_path)
+            dialog.set_initial_folder(default_folder)
+            
+            default_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_new.json"
+            dialog.set_initial_name(default_filename)
+
+            # File filter for JSON
+            json_filter = Gtk.FileFilter()
+            json_filter.set_name("JSON Transcript Files (*.json)")
+            json_filter.add_mime_type("application/json")
+            json_filter.add_pattern("*.json")
+            
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            filters.append(json_filter)
+            dialog.set_filters(filters)
+            dialog.set_default_filter(json_filter)
+
+            dialog.save(self, None, self._on_new_transcript_file_selected_for_save, current_transcript_data)
+
+    def _on_new_transcript_file_selected_for_save(self, dialog, result, transcript_data_to_save):
+        """Callback for Gtk.FileDialog.save() for new transcripts."""
+        try:
+            file = dialog.save_finish(result)
+            if file:
+                target_path = file.get_path()
+                print(f"New transcript save path selected: {target_path}")
+
+                # Ensure the data to save has all required fields from spec §1.1
+                # This is a new save, so some fields need to be generated.
+                final_data_to_save = {
+                    "uuid": str(uuid.uuid4()), # New UUID
+                    "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"), # New timestamp
+                    "text": transcript_data_to_save.get("text", ""),
+                    "segments": transcript_data_to_save.get("segments", []),
+                    "language": transcript_data_to_save.get("language", self.settings.get_string("target-language") if not self.settings.get_boolean("auto-detect-language") else "en"), # Best guess for language
+                    "source_path": "",  # No original media source for a brand new, unsaved transcript unless explicitly set
+                    "audio_source_path": "", # ditto
+                    "output_filename": os.path.basename(target_path)
+                }
+                
+                app = self.get_application()
+                if not app or not hasattr(app, 'io_pool') or not app.io_pool:
+                    print("Error: I/O thread pool not available on application object.")
+                    ToastPresenter.show(self, "❌ Save failed: Thread pool error.")
+                    return
+
+                def save_operation():
+                    try:
+                        atomic_write_json(final_data_to_save, target_path)
+                        ToastPresenter.show(self, f"Saved ✓ {os.path.basename(target_path)}")
+                        GLib.idle_add(self.history_view.refresh_list)
+                        # After a successful new save, update the transcript_view's current item
+                        # This requires TranscriptItem to be created and loaded back or updated in view
+                        # For now, this part is deferred until TranscriptView has better state management.
+                        # Ideally:
+                        # new_item = TranscriptItem.load_from_json(target_path)
+                        # if new_item:
+                        # GLib.idle_add(self.transcript_view.set_current_item, new_item) # Method to be created
+                    except Exception as e:
+                        print(f"Error saving new transcript to {target_path}: {e}")
+                        ToastPresenter.show(self, f"❌ Could not save {os.path.basename(target_path)}: {e}")
+                
+                app.io_pool.submit(save_operation)
+
+            else:
+                print("Save operation cancelled by user.")
+                ToastPresenter.show(self, "Save cancelled.")
+        except GLib.Error as e:
+            if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                 print("File save operation cancelled by user (GLib.Error).")
+                 ToastPresenter.show(self, "Save cancelled.")
+            else:
+                 print(f"GLib error during file save dialog: {e}")
+                 ToastPresenter.show(self, f"❌ Save error: {e}")
+        except Exception as e:
+            print(f"Unexpected error during file save dialog callback: {e}")
+            ToastPresenter.show(self, f"❌ Unexpected save error: {e}")
 
 
     def _on_reader_button_clicked(self, button):
@@ -722,13 +1274,11 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         full_text_parts = []
         if self._selected_history_transcript.segments:
             for segment in self._selected_history_transcript.segments:
-                 if isinstance(segment, SegmentItem):
+                    # isinstance check removed as TranscriptItem.load_from_json ensures SegmentItem instances
                     start_m, start_s = divmod(int(segment.start), 60)
                     end_m, end_s = divmod(int(segment.end), 60)
                     timestamp = f"[{start_m:02d}:{start_s:02d} → {end_m:02d}:{end_s:02d}]"
                     full_text_parts.append(f"{timestamp}\n{segment.text}\n")
-                 else:
-                    print(f"Warning: Skipping non-SegmentItem in reader mode: {type(segment)}")
         full_text = "".join(full_text_parts)
 
         if not full_text:
@@ -784,3 +1334,4 @@ class GnomeRecastWindow(Adw.ApplicationWindow):
         reader_window.present()
 
         print("Reader mode window displayed.")
+

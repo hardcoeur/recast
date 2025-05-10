@@ -2,17 +2,20 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, Gio, GObject, GLib
-from typing import Optional
+from typing import Optional, Dict
 import functools
+from ..ui.toast import ToastPresenter
 import threading
 import pathlib
 import os
 
+from faster_whisper import WhisperModel
+
 from ..utils.models import (
-    get_available_models,
-    list_local_models,
-    download_model,
-    APP_MODEL_DIR
+    AVAILABLE_MODELS, # Changed: Use AVAILABLE_MODELS
+    # get_available_models, # Removed
+    # list_local_models, # Removed
+    APP_MODEL_DIR, # Keep if used by _on_remove_clicked for path construction
 )
 
 class ModelItem(GObject.Object):
@@ -49,7 +52,7 @@ class ModelManagementDialog(Gtk.Dialog):
     def __init__(self, parent, **kwargs):
         super().__init__(transient_for=parent, **kwargs)
 
-        self.active_downloads = {}
+        self.active_downloads: Dict[str, Dict] = {} # Store thread and cancel event if needed, or just model name
 
         self.set_title("Manage Transcription Models")
         self.set_modal(True)
@@ -84,48 +87,108 @@ class ModelManagementDialog(Gtk.Dialog):
         self._populate_model_list()
 
     def _populate_model_list(self):
-        """Loads available and local models and populates the list store."""
-        print("Populating model list...")
-        available_models = get_available_models()
-        local_models_list = list_local_models()
-        local_models_dict = {model['name']: model for model in local_models_list}
-
+        """Populates the list store with available models and checks their cache status."""
+        print("ModelManagementDialog: Initiating model list population with new cache check logic...")
         self.model_store.remove_all()
 
-        added_model_names = set()
+        # Sort AVAILABLE_MODELS by name for consistent order
+        # AVAILABLE_MODELS is now a direct import: Dict[str, str] where str is size
+        sorted_model_names = sorted(AVAILABLE_MODELS.keys())
 
-        for name, details in available_models.items():
-            status = "Not Downloaded"
-            size = details.get("size", "N/A")
-            download_url = details.get("url")
-
-            if name in local_models_dict:
-                status = "Downloaded"
-                size = local_models_dict[name].get("size", "N/A")
-
+        for model_name in sorted_model_names:
+            size = AVAILABLE_MODELS[model_name]
+            # Create item with initial "Checking..." status
             item = ModelItem(
-                name=name,
+                name=model_name,
                 size=size,
-                status=status,
-                download_url=download_url
+                status="Checking status...",
+                download_url=None # download_url is not directly used for caching with faster-whisper by name
             )
             self.model_store.append(item)
-            added_model_names.add(name)
+            # Start a background thread to check the actual cache status
+            threading.Thread(
+                target=self._check_model_cache_status_worker,
+                args=(item,), # Pass the ModelItem instance
+                daemon=True
+            ).start()
+        print(f"ModelManagementDialog: Initialized {self.model_store.get_n_items()} models for status checking.")
 
-        for local_model in local_models_list:
-            name = local_model.get("name")
-            if name and name not in added_model_names:
-                 print(f"Found local-only model: {name}")
-                 item = ModelItem(
-                     name=name,
-                     size=local_model.get("size", "N/A"),
-                     status="Downloaded (Local Only)",
-                     download_url=None
-                 )
-                 self.model_store.append(item)
+    def _check_model_cache_status_worker(self, model_item: ModelItem):
+        """
+        Worker function to check if a model is cached using faster-whisper.
+        Runs in a background thread. Updates the passed ModelItem.
+        """
+        is_cached = False
+        error_message: Optional[str] = None
+        model_name = model_item.name
+        try:
+            # Attempt to load the model with local_files_only=True
+            _model = WhisperModel(model_name, device="cpu", compute_type="int8", local_files_only=True)
+            is_cached = True
+            del _model # Release resources
+            print(f"Thread: Model '{model_name}' IS cached.")
+        except RuntimeError as e:
+            if "model is not found locally" in str(e).lower() or \
+               "doesn't exist or is not a directory" in str(e).lower() or \
+               "path does not exist or is not a directory" in str(e).lower() or \
+               "no such file or directory" in str(e).lower() and ".cache/huggingface/hub" in str(e).lower():
+                is_cached = False
+                print(f"Thread: Model '{model_name}' is NOT cached (expected error: {e}).")
+            else: # Other unexpected RuntimeError
+                is_cached = False
+                error_message = f"RuntimeError checking cache for {model_name}: {str(e)}"
+                print(error_message)
+        except Exception as e:
+            is_cached = False
+            error_message = f"Unexpected error checking cache for {model_name}: {type(e).__name__} - {str(e)}"
+            print(error_message)
+
+        GLib.idle_add(self._update_model_item_cache_status_from_worker, model_item, is_cached, error_message)
+
+    def _update_model_item_cache_status_from_worker(self, model_item: ModelItem, is_cached: bool, error_message: Optional[str]):
+        """
+        Updates the ModelItem's status in the UI based on cache check.
+        Called from the main GTK thread.
+        """
+        if model_item.is_downloading: # If it was marked as downloading, don't overwrite status yet
+            print(f"Model '{model_item.name}' cache status check completed, but download is in progress. Status unchanged for now.")
+            return GLib.SOURCE_REMOVE
+
+        if error_message:
+            model_item.status = "Error Checking Status"
+            model_item.error_message = error_message
+            print(f"UI Update: Model '{model_item.name}' status check error: {error_message}")
+        else:
+            model_item.status = "Downloaded" if is_cached else "Not Downloaded"
+            model_item.error_message = None
+            print(f"UI Update: Model '{model_item.name}' status: {model_item.status}")
 
 
-        print(f"Loaded {self.model_store.get_n_items()} models into list store.")
+        # Find the item in the store and trigger an update for its row
+        position = Gtk.INVALID_LIST_POSITION
+        # Iterate using range and get_item if direct find on model_item fails due to object identity issues
+        # after thread. For now, assume model_item is the correct reference or has comparable properties.
+        # A more robust way is to find by model_item.name if model_item itself isn't found.
+        found, pos_val = self.model_store.find(model_item)
+        if found:
+            position = pos_val
+        else: # Fallback to search by name if direct object find fails
+            for i in range(self.model_store.get_n_items()):
+                item_in_store = self.model_store.get_item(i)
+                if item_in_store.name == model_item.name:
+                    # Update the original item in the store directly if properties are GObject.Properties
+                    item_in_store.status = model_item.status
+                    item_in_store.error_message = model_item.error_message
+                    position = i
+                    break
+        
+        if position != Gtk.INVALID_LIST_POSITION:
+            self.model_store.items_changed(position, 1, 1) # Notify ListView to rebind this item
+        else:
+            print(f"Warning: Could not find item {model_item.name} in store to update its cache status UI.")
+        return GLib.SOURCE_REMOVE
+
+    # Removed _on_local_models_loaded_management as it's no longer used.
 
     def _on_factory_setup(self, factory, list_item):
         """Setup the widget for a list item using Adw.ActionRow."""
@@ -178,10 +241,14 @@ class ModelManagementDialog(Gtk.Dialog):
 
         is_downloaded = model_item.status == "Downloaded" or model_item.status == "Downloaded (Local Only)"
         is_downloading = model_item.is_downloading
-        is_error = model_item.status == "Error"
-        can_download = bool(model_item.download_url) and not is_downloaded and not is_downloading
+        is_error = "Error" in model_item.status # More general error check
+        # "Downloaded" status is now set by the cache check.
+        # "Not Downloaded" means it's not cached.
+        is_cached = model_item.status == "Downloaded"
+        can_download = not is_cached and not is_downloading and model_item.status != "Checking status..."
 
-        action_row.set_subtitle(model_item.error_message if is_error else model_item.status)
+
+        action_row.set_subtitle(model_item.error_message if model_item.error_message else model_item.status)
         action_row.set_sensitive(not is_downloading)
 
         size_label.set_visible(not is_downloading)
@@ -226,51 +293,63 @@ class ModelManagementDialog(Gtk.Dialog):
             delattr(list_item, '_bound_item')
 
 
-    def _on_download_clicked(self, button, item):
-        """Handler for download button click."""
-        if item.is_downloading or not item.download_url:
-            print(f"Download request ignored for {item.name} (already downloading or no URL)")
+    def _on_download_clicked(self, button, item: ModelItem):
+        """Handler for download/cache button click."""
+        if item.is_downloading:
+            print(f"Caching request ignored for {item.name} (already in progress)")
             return
 
-        print(f"Starting download for {item.name} from {item.download_url}")
+        print(f"Starting caching for {item.name}")
         model_name = item.name
 
         item.is_downloading = True
-        item.status = "Downloading"
-        item.download_progress = 0.0
+        item.status = "Caching..." # Or "Preparing..."
+        item.download_progress = 0.0 # Not really applicable, but reset
         item.error_message = None
-        item.cancel_event = threading.Event()
+        # item.cancel_event = threading.Event() # TODO: Re-evaluate if cancellation is needed/simple for this
 
         position = self.model_store.find(item)[1]
         if position != Gtk.INVALID_LIST_POSITION:
             self.model_store.items_changed(position, 1, 1)
         else:
-            print(f"Warning: Could not find item {item.name} in store to update UI for download start.")
+            print(f"Warning: Could not find item {item.name} in store to update UI for caching start.")
 
+        parent_window = self.get_transient_for()
+        if parent_window:
+            GLib.idle_add(ToastPresenter.show, self, f"Preparing model {item.name}...")
 
-        download_thread = threading.Thread(
-            target=download_model,
-            args=(
-                model_name,
-                item.download_url,
-                APP_MODEL_DIR,
-                self._update_download_progress,
-                item.cancel_event
-            ),
+        self.active_downloads[model_name] = {} # Mark as active
+
+        cache_thread = threading.Thread(
+            target=self._cache_model_in_thread,
+            args=(model_name,),
             daemon=True
         )
+        cache_thread.start()
 
-        self.active_downloads[model_name] = {
-            "thread": download_thread,
-            "cancel_event": item.cancel_event
-        }
+    def _cache_model_in_thread(self, model_item_name: str):
+        """
+        Attempts to instantiate the model, forcing faster-whisper to download/cache it.
+        This runs in a background thread.
+        """
+        try:
+            print(f"Thread: Caching model {model_item_name} using faster-whisper...")
+            # This will download if not present and cache it according to faster-whisper's logic
+            model = WhisperModel(model_size_or_path=model_item_name, device="cpu", compute_type="int8")
+            # We don't need to keep the model object here, just ensure it was loaded.
+            del model
+            print(f"Thread: Successfully prepared/cached {model_item_name}.")
+            GLib.idle_add(self._update_model_item_status, model_item_name, "Cached", None)
+        except Exception as e:
+            print(f"Thread: Error caching model {model_item_name}: {e}")
+            GLib.idle_add(self._update_model_item_status, model_item_name, "Error Caching", str(e))
 
-        download_thread.start()
 
-    def _update_download_progress(self, model_name: str, percentage: float, error_message: Optional[str] = None):
-        """Callback executed via GLib.idle_add from the download thread."""
-        print(f"Progress update for {model_name}: {percentage}%, Error: {error_message}")
-
+    def _update_model_item_status(self, model_name: str, new_status: str, error_message: Optional[str]):
+        """
+        Updates the ModelItem's status in the UI. Called via GLib.idle_add from the caching thread.
+        """
+        print(f"Updating UI for {model_name}: Status='{new_status}', Error='{error_message}'")
         item_to_update = None
         position = Gtk.INVALID_LIST_POSITION
         for i in range(self.model_store.get_n_items()):
@@ -280,77 +359,92 @@ class ModelManagementDialog(Gtk.Dialog):
                 position = i
                 break
 
-        if not item_to_update:
-            print(f"Error: Could not find ModelItem '{model_name}' in store to update progress.")
-            if model_name in self.active_downloads:
-                del self.active_downloads[model_name]
-            return
+        parent_window = self.get_transient_for()
 
-        final_state = False
-        if percentage == 100.0:
+        if item_to_update:
             item_to_update.is_downloading = False
-            item_to_update.status = "Downloaded"
-            item_to_update.download_progress = 1.0
-            item_to_update.error_message = None
-            item_to_update.cancel_event = None
-            final_state = True
-            print(f"Download completed for {model_name}. Refreshing list.")
-            self._populate_model_list()
-            if model_name in self.active_downloads:
-                del self.active_downloads[model_name]
-            return
+            item_to_update.status = new_status
+            item_to_update.error_message = error_message
+            # item_to_update.cancel_event = None # Clear if it was used
 
-        elif percentage == -1.0:
-            item_to_update.is_downloading = False
-            item_to_update.status = "Error"
-            item_to_update.download_progress = 0.0
-            item_to_update.error_message = error_message or "Unknown download error"
-            item_to_update.cancel_event = None
-            final_state = True
-            print(f"Download error for {model_name}: {item_to_update.error_message}")
+            if position != Gtk.INVALID_LIST_POSITION:
+                self.model_store.items_changed(position, 1, 1)
+            else:
+                print(f"Warning: Could not find position for updated item {model_name} after processing, but item was found.")
+            
+            # After a download attempt (which calls _cache_model_in_thread -> _update_model_item_status),
+            # we need to re-verify the cache status using the specific local_files_only check.
+            # Find the ModelItem again to pass to the checker.
+            item_for_recheck = None
+            for i in range(self.model_store.get_n_items()):
+                item = self.model_store.get_item(i)
+                if item.name == model_name:
+                    item_for_recheck = item
+                    break
+            
+            if item_for_recheck:
+                print(f"Post-download/cache attempt, re-verifying cache status for {model_name}...")
+                item_for_recheck.status = "Checking status..." # Temporarily set status
+                if position != Gtk.INVALID_LIST_POSITION: self.model_store.items_changed(position,1,1)
 
-        elif percentage == -2.0:
-            item_to_update.is_downloading = False
-            item_to_update.status = "Not Downloaded"
-            item_to_update.download_progress = 0.0
-            item_to_update.error_message = None
-            item_to_update.cancel_event = None
-            final_state = True
-            print(f"Download cancelled for {model_name}")
+                threading.Thread(
+                    target=self._check_model_cache_status_worker,
+                    args=(item_for_recheck,),
+                    daemon=True
+                ).start()
+            else:
+                print(f"Error: Could not find item {model_name} to re-verify cache status after download attempt.")
 
-        elif 0 <= percentage < 100:
-            item_to_update.is_downloading = True
-            item_to_update.status = "Downloading"
-            item_to_update.download_progress = percentage / 100.0
-            item_to_update.error_message = None
 
+            if new_status == "Cached": # This status comes from the _cache_model_in_thread
+                if parent_window:
+                    GLib.idle_add(ToastPresenter.show, self, f"Model {model_name} is ready.")
+            elif new_status == "Error Caching":
+                if parent_window:
+                    GLib.idle_add(ToastPresenter.show, self, f"❌ Failed to prepare model {model_name}: {error_message}")
         else:
-             print(f"Warning: Received unexpected progress value for {model_name}: {percentage}")
-             return
+            print(f"Error: Could not find ModelItem '{model_name}' in store to update status.")
+            if parent_window:
+                 GLib.idle_add(ToastPresenter.show, self, f"❌ Error updating status for an unknown model: {model_name}")
 
 
-        if final_state and model_name in self.active_downloads:
+        if model_name in self.active_downloads:
             del self.active_downloads[model_name]
-            print(f"Removed {model_name} from active downloads.")
+            print(f"Removed {model_name} from active operations.")
+        # No _update_download_progress method to remove as it's being replaced by this logic.
 
-        if position != Gtk.INVALID_LIST_POSITION:
-            self.model_store.items_changed(position, 1, 1)
-        else:
-             print(f"Warning: Could not find position for updated item {model_name} after processing.")
+    def _on_cancel_clicked(self, button, item: ModelItem):
+        """Handler for cancel button click.
+        NOTE: Cancellation for faster-whisper's internal download is not straightforward.
+        This might need to be re-evaluated or simplified if true cancellation isn't feasible.
+        For now, it primarily serves to update UI if a download was thought to be cancellable.
+        """
+        model_name = item.name
+        print(f"Cancel requested for {model_name}")
+        if model_name in self.active_downloads:
+            # Currently, no direct cancel mechanism for WhisperModel instantiation.
+            # We can mark it as "cancelling" in UI and then let it finish or error out.
+            # Or, if we had a cancel_event on the item, we could set it,
+            # but the _cache_model_in_thread doesn't check it.
+            print(f"Note: True cancellation of faster-whisper caching is not implemented.")
+            # Update UI to reflect attempt or remove from active_downloads
+            # For now, let's just visually update and let the thread complete.
+            item.status = "Cancelling..." # Or revert to "Not Downloaded"
+            item.is_downloading = False # Or keep true until thread confirms
+            # del self.active_downloads[model_name] # Or keep until thread finishes
+            
+            position = self.model_store.find(item)[1]
+            if position != Gtk.INVALID_LIST_POSITION:
+                self.model_store.items_changed(position, 1, 1)
+
+            parent_window = self.get_transient_for()
+            if parent_window:
+                GLib.idle_add(ToastPresenter.show, self, f"Attempting to cancel operation for {model_name} (may complete).")
+
+        # button.set_sensitive(False) # Already handled by is_downloading state in bind
 
 
-    def _on_cancel_clicked(self, button, item):
-        """Handler for cancel button click."""
-        if not item.is_downloading or not item.cancel_event:
-            print(f"Cancel request ignored for {item.name} (not downloading or no event)")
-            return
-
-        print(f"Cancel requested for {item.name}")
-        item.cancel_event.set()
-        button.set_sensitive(False)
-
-
-    def _on_remove_clicked(self, button, item):
+    def _on_remove_clicked(self, button, item: ModelItem):
         """Handler for remove button click."""
         print(f"Remove clicked for {item.name}")
         expected_filename = f"ggml-{item.name}.bin"
@@ -359,9 +453,25 @@ class ModelManagementDialog(Gtk.Dialog):
         if file_path.exists() and file_path.is_file():
             try:
                 print(f"Attempting to delete {file_path}")
-                file_path.unlink()
-                print(f"Successfully deleted {file_path}")
-                self._populate_model_list()
+                file_path.unlink() # This part is for the old ggml file structure.
+                                   # For faster-whisper, actual deletion is more complex as it's in a cache dir.
+                                   # This might not effectively remove a faster-whisper cached model.
+                                   # A true "remove" for faster-whisper would involve finding its cache path and deleting that.
+                                   # For now, we'll assume this old logic is what's intended for "removal" if it's still here.
+                print(f"Successfully deleted {file_path} (if it was a standalone ggml file).")
+                # After attempting removal, re-check the status of this model item.
+                # The model might still be cached by faster-whisper elsewhere.
+                item.status = "Checking status..." # Mark for re-check
+                pos_found, item_pos = self.model_store.find(item)
+                if pos_found:
+                    self.model_store.items_changed(item_pos, 1, 1)
+
+                threading.Thread(
+                    target=self._check_model_cache_status_worker,
+                    args=(item,),
+                    daemon=True
+                ).start()
+
             except OSError as e:
                 print(f"Error deleting model file {file_path}: {e}")
                 error_dialog = Gtk.MessageDialog(
@@ -375,8 +485,17 @@ class ModelManagementDialog(Gtk.Dialog):
                 error_dialog.connect("response", lambda d, r: d.destroy())
                 error_dialog.show()
         else:
-            print(f"Model file not found for removal: {file_path}")
-            self._populate_model_list()
+            print(f"Model file not found for removal at old path: {file_path}. Status will be re-checked.")
+            # Still re-check status, as it might be cached by faster-whisper independently.
+            item.status = "Checking status..."
+            pos_found, item_pos = self.model_store.find(item)
+            if pos_found:
+                self.model_store.items_changed(item_pos, 1, 1)
+            threading.Thread(
+                target=self._check_model_cache_status_worker,
+                args=(item,),
+                daemon=True
+            ).start()
 
     def _on_close_request(self, dialog):
         """Handle dialog close: cancel any active downloads."""

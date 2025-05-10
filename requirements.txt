@@ -1,5 +1,6 @@
-PyGObject
+numpy>=1.21.0
+onnxruntime>=1.10.0
+av>=9.0.0
+hypothesis>=6.0.0
+pytest>=7.0.0
 faster-whisper
-feedparser
-requests
-# Note: GTK4 and its dependencies (like GStreamer) must be installed via the system package manager.

@@ -3,10 +3,13 @@ import os
 from gi.repository import Gtk, Adw, Gio, Pango, GObject, GLib, Gdk
 
 import threading
+from typing import Optional # Added for type hinting
 # Updated import for AudioCapturer, removed old list_audio_input_devices
-from ..audio.capture import AudioCapturer 
+from ..audio.capture import AudioCapturer
 from ..audio.device_utils import get_input_devices, AudioInputDevice # New import
-from ..utils.models import list_local_models, get_available_models, download_model, APP_MODEL_DIR
+from ..utils.models import AVAILABLE_MODELS # Changed: Import AVAILABLE_MODELS
+from faster_whisper import WhisperModel # Added for model caching
+from ..ui.toast import ToastPresenter
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -33,16 +36,17 @@ class PreferencesWindow(Adw.PreferencesDialog):
 
 
         self.is_testing = False
-        self.test_capturer: Optional[AudioCapturer] = None # Type hint
+        self.test_capturer: Optional[AudioCapturer] = None
         self.test_audio_level = 0.0
         self.level_update_timer_id = None
 
         self.connect("destroy", self._on_destroy)
 
-        self.available_models = get_available_models()
-        self.local_model_names = {m['name'] for m in list_local_models()}
+        self.available_models = AVAILABLE_MODELS # Changed: Use imported AVAILABLE_MODELS
+        self.local_model_names = set() # Initialize as empty
         self.pref_active_download = None
-
+        # Removed: list_local_models(self._on_local_models_loaded_preferences)
+        # Model status will be checked by _initiate_model_status_checks() called later in __init__
 
         general_page = Adw.PreferencesPage()
         general_page.set_title("General")
@@ -141,12 +145,14 @@ class PreferencesWindow(Adw.PreferencesDialog):
 
         self.model_row = Adw.ComboRow()
         self.model_row.set_title("Default model")
-        model_list = ["tiny", "base", "small", "medium", "large"] # These are keys for available_models
-        model_list_model = Gtk.StringList.new(model_list)
+        # Use the actual keys from available_models for the dropdown
+        # self.available_models is populated in __init__
+        model_names_for_dropdown = sorted(list(self.available_models.keys()))
+        model_list_model = Gtk.StringList.new(model_names_for_dropdown)
         self.model_row.set_model(model_list_model)
         transcription_group.add(self.model_row)
         self._bind_combo_row_string_setting(
-            self.model_row, "default-model"
+            self.model_row, "default-model" # This gsetting stores the selected model name key
         )
 
         device_row = Adw.ComboRow()
@@ -156,6 +162,14 @@ class PreferencesWindow(Adw.PreferencesDialog):
         device_row.set_model(device_list_model)
         transcription_group.add(device_row)
         self._bind_device_combo_row(device_row, "whisper-device-mode")
+
+        compute_type_row = Adw.ComboRow()
+        compute_type_row.set_title("Compute Type")
+        compute_types = ["auto", "int8", "float16", "float32"]
+        compute_type_model = Gtk.StringList.new(compute_types)
+        compute_type_row.set_model(compute_type_model)
+        transcription_group.add(compute_type_row)
+        self._bind_combo_row_string_setting(compute_type_row, "whisper-compute-type")
 
 
         model_suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -304,6 +318,78 @@ class PreferencesWindow(Adw.PreferencesDialog):
             Gio.SettingsBindFlags.DEFAULT,
         )
         appearance_group.add(font_size_row)
+
+        self._initiate_model_status_checks() # New: Start checking model statuses
+
+    def _initiate_model_status_checks(self):
+        """
+        Starts background checks for the cache status of each available model.
+        This should be called after the model_row UI is set up.
+        """
+        for model_name in self.available_models.keys(): # self.available_models is already set
+            threading.Thread(
+                target=self._check_model_cache_status_thread_worker,
+                args=(model_name,),
+                daemon=True
+            ).start()
+
+    def _check_model_cache_status_thread_worker(self, model_name: str):
+        """
+        Worker function to check if a model is cached using faster-whisper.
+        Runs in a background thread.
+        """
+        is_cached = False
+        error_message: Optional[str] = None
+        try:
+            # Attempt to load the model with local_files_only=True
+            _model = WhisperModel(model_name, device="cpu", compute_type="int8", local_files_only=True)
+            is_cached = True
+            del _model # Release resources
+        except RuntimeError as e: # faster-whisper often raises RuntimeError for missing models with local_files_only
+            # Check for specific messages indicating the model is not found locally
+            if "model is not found locally" in str(e).lower() or \
+               "doesn't exist or is not a directory" in str(e).lower() or \
+               "path does not exist or is not a directory" in str(e).lower() or \
+               "no such file or directory" in str(e).lower() and ".cache/huggingface/hub" in str(e).lower(): # More specific for HF cache
+                is_cached = False
+                # This is an expected "error" when the model is not cached, so no error_message for console.
+            else: # Other unexpected RuntimeError
+                is_cached = False
+                error_message = f"RuntimeError checking cache for {model_name}: {str(e)}"
+                print(error_message) # Log unexpected errors
+        except Exception as e:
+            is_cached = False
+            error_message = f"Unexpected error checking cache for {model_name}: {type(e).__name__} - {str(e)}"
+            print(error_message) # Log unexpected errors
+
+        GLib.idle_add(self._update_model_status_ui, model_name, is_cached, error_message)
+
+    def _update_model_status_ui(self, model_name: str, is_cached: bool, error: Optional[str]):
+        """
+        Updates the UI and internal state based on the model's cache status.
+        Called from the main GTK thread via GLib.idle_add.
+        """
+        if error:
+            # Log to console, a toast might be too noisy for "not found" during initial scan.
+            # print(f"PreferencesWindow: Info checking cache for {model_name}: {error}")
+            pass # Error already printed in worker for unexpected ones.
+
+        if is_cached:
+            self.local_model_names.add(model_name)
+        else:
+            if model_name in self.local_model_names:
+                self.local_model_names.remove(model_name)
+
+        # If the currently selected model in the dropdown is the one we just checked,
+        # refresh its UI elements (like the download button).
+        selected_idx = self.model_row.get_selected()
+        model_in_combo = self.model_row.get_model()
+        if isinstance(model_in_combo, Gtk.StringList) and selected_idx != Gtk.INVALID_LIST_POSITION:
+            current_selected_model_name = model_in_combo.get_string(selected_idx)
+            if current_selected_model_name == model_name:
+                self._on_selected_model_changed(self.model_row, None) # Trigger UI update for current selection
+
+        return GLib.SOURCE_REMOVE # One-shot callback
 
     def _on_choose_autosave_folder_clicked(self, button):
         dialog = Gtk.FileDialog(modal=True)
@@ -615,16 +701,8 @@ X-GNOME-Autostart-enabled=true
     def _on_destroy(self, window, *args):
         if self.is_testing: self._stop_audio_test()
         
-        # Model download logic (simplified for brevity, original logic assumed correct)
-        selected_idx = self.model_row.get_selected()
-        if selected_idx != Gtk.INVALID_LIST_POSITION:
-            model_name = self.model_row.get_model().get_string(selected_idx)
-            if model_name:
-                self.local_model_names = {m['name'] for m in list_local_models()}
-                is_available = model_name in self.available_models
-                is_local = model_name in self.local_model_names
-                if is_available and not is_local and self.pref_active_download is None:
-                    self._start_model_download(model_name)
+        # Model download logic is now triggered by user action, not on destroy.
+        # The old logic here is removed.
         
         # Disconnect GSettings handlers - important for manually connected signals
         # This would require storing handler IDs for each `self.settings.connect` call
@@ -641,15 +719,17 @@ X-GNOME-Autostart-enabled=true
             if isinstance(model, Gtk.StringList):
                 model_name = model.get_string(selected_idx)
                 if model_name:
-                    is_available = model_name in self.available_models
+                    # self.local_model_names is now updated by _update_model_status_ui
+                    # as background checks complete.
+                    is_available = model_name in self.available_models # self.available_models is from AVAILABLE_MODELS
                     is_local = model_name in self.local_model_names
                     show_button = is_available and not is_local
 
                     if self.pref_active_download and self.pref_active_download['name'] == model_name:
-                        show_button = False 
+                        show_button = False
 
                     self.download_model_button.set_visible(show_button)
-                    self.download_model_button.set_sensitive(self.pref_active_download is None) 
+                    self.download_model_button.set_sensitive(self.pref_active_download is None)
                     return
         self.download_model_button.set_visible(False)
 
@@ -662,42 +742,96 @@ X-GNOME-Autostart-enabled=true
                 model_name = model.get_string(selected_idx)
                 if model_name:
                     is_available = model_name in self.available_models
-                    is_local = model_name in self.local_model_names 
+                    # self.local_model_names will be updated by _update_pref_download_ui or _on_selected_model_changed
+                    is_local = model_name in self.local_model_names
                     if is_available and not is_local:
                         self._start_model_download(model_name)
 
 
-    def _start_model_download(self, model_name: str):
-        if self.pref_active_download is not None: return
-        model_info = self.available_models.get(model_name)
-        if not model_info or 'url' not in model_info: return
+    def _cache_model_thread_worker(self, model_name_to_cache: str):
+        """
+        Worker function for the background thread to cache the model using faster-whisper.
+        """
+        # Ensure WhisperModel is imported in the thread if not globally accessible in this context
+        # from faster_whisper import WhisperModel # Already imported at the top of the file
+        try:
+            # This will download and cache the model if not already present in faster-whisper's cache
+            # Using basic device/compute_type as the goal is just caching.
+            _model = WhisperModel(model_size_or_path=model_name_to_cache, device="cpu", compute_type="int8")
+            # Optionally, you might want to del _model here if memory is a concern immediately after caching
+            # del _model
+            GLib.idle_add(self._update_pref_download_ui, model_name_to_cache, True, None)
+        except Exception as e:
+            GLib.idle_add(self._update_pref_download_ui, model_name_to_cache, False, str(e))
 
-        self.model_row.set_sensitive(False) 
-        self.download_model_button.set_visible(False) 
-        self.download_spinner.set_visible(True); self.download_spinner.start()
-        cancel_event = threading.Event()
-        self.pref_active_download = {'name': model_name, 'cancel_event': cancel_event}
+
+    def _start_model_download(self, model_name: str):
+        if self.pref_active_download is not None:
+            # Already a download in progress, or this is a stale call.
+            # Potentially log or show a toast if trying to start another.
+            return
+
+        parent_window = self.get_native()
+        if parent_window:
+            GLib.idle_add(ToastPresenter.show, self, f"Preparing model {model_name}...")
+
+        self.model_row.set_sensitive(False)
+        self.download_model_button.set_visible(False)
+        self.download_spinner.set_visible(True)
+        self.download_spinner.start()
+        
+        self.pref_active_download = {'name': model_name} # Removed 'cancel_event'
+
         threading.Thread(
-            target=download_model,
-            args=(model_name, model_info['url'], APP_MODEL_DIR, self._update_pref_download_progress, cancel_event),
+            target=self._cache_model_thread_worker,
+            args=(model_name,), # Pass model_name directly
             daemon=True
         ).start()
 
+    # _update_pref_download_progress method is removed as per instructions.
 
-    def _update_pref_download_progress(self, model_name: str, percentage: float, error_message: str | None):
-        GLib.idle_add(self._update_pref_download_ui, model_name, percentage, error_message)
-
-
-    def _update_pref_download_ui(self, model_name: str, percentage: float, error_message: str | None):
+    def _update_pref_download_ui(self, model_name: str, success: bool, error_message: Optional[str]):
+        """
+        Callback executed in the main GTK thread after model caching attempt.
+        Handles UI updates based on success or failure.
+        """
+        # It's possible this callback fires after the window is closed or download was "cancelled"
+        # by user navigating away or selecting another model.
+        # Check if the download it refers to is still the active one.
         if not self.pref_active_download or self.pref_active_download['name'] != model_name:
-            return GLib.SOURCE_REMOVE 
-        is_finished = percentage >= 100.0 or percentage < 0
-        if is_finished:
-            self.download_spinner.stop(); self.download_spinner.set_visible(False)
-            self.model_row.set_sensitive(True)
-            self.local_model_names = {m['name'] for m in list_local_models()}
-            self._on_selected_model_changed(self.model_row, None) 
-            self.pref_active_download = None 
-            # print(f"Download finished for {model_name}. Percentage: {percentage}, Error: {error_message}")
-            return GLib.SOURCE_REMOVE 
-        return GLib.SOURCE_CONTINUE # If we had a progress bar to update continuously
+            # If a new download started for a different model, or no download is active,
+            # this callback is stale. Stop spinner if it's for this model, but don't reset UI globally.
+            if self.download_spinner.is_spinning() and (not self.pref_active_download or self.pref_active_download.get('name') == model_name):
+                 self.download_spinner.stop()
+                 self.download_spinner.set_visible(False)
+            return GLib.SOURCE_REMOVE # Stale or irrelevant callback
+
+        self.download_spinner.stop()
+        self.download_spinner.set_visible(False)
+        self.model_row.set_sensitive(True)
+
+        # Re-check the cache status for the model that was attempted to be downloaded/cached.
+        # This will update self.local_model_names and the UI via _update_model_status_ui.
+        threading.Thread(
+            target=self._check_model_cache_status_thread_worker,
+            args=(model_name,), # model_name is the one from the download attempt
+            daemon=True
+        ).start()
+        
+        self.pref_active_download = None # Reset active download state
+
+        parent_window = self.get_native()
+        if parent_window:
+            if success:
+                GLib.idle_add(ToastPresenter.show, self, f"Model {model_name} is ready.")
+            else:
+                error_msg_display = error_message if error_message else "Unknown error"
+                GLib.idle_add(ToastPresenter.show, self, f"❌ Failed to prepare model {model_name}: {error_msg_display}")
+        
+        return GLib.SOURCE_REMOVE # Callback is one-shot and has completed its work
+
+    # Removed _on_local_models_loaded_preferences as it's no longer needed.
+    # Model status is now checked individually by _check_model_cache_status_thread_worker
+    # and UI updated by _update_model_status_ui.
+
+    # Removed _on_local_models_loaded_after_download for the same reasons.

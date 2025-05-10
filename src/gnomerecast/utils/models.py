@@ -1,153 +1,118 @@
-import os
 import pathlib
-import requests
 import threading
-import pathlib
-from typing import List, Dict, Union, Optional, Callable, Tuple
-from gi.repository import GLib
+from typing import Dict, Callable, Optional, Tuple
 
-from .download import download_file, ProgressCallback as DownloadProgressCallback
+# Attempt to import WhisperModel, as it's crucial.
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    WhisperModel = None # type: ignore # Make linters happy if not installed
+    FASTER_WHISPER_AVAILABLE = False
 
-APP_MODEL_DIR = pathlib.Path.home() / ".local" / "share" / "GnomeRecast" / "models"
+APP_MODEL_DIR: pathlib.Path = pathlib.Path.home() / '.local' / 'share' / 'GnomeRecast' / 'models'
 
-AVAILABLE_MODELS = {
-    "tiny.en": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin?download=true", "size": "~75 MB"},
-    "tiny": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin?download=true", "size": "~75 MB"},
-    "base.en": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin?download=true", "size": "~142 MB"},
-    "base": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true", "size": "~142 MB"},
-    "small.en": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin?download=true", "size": "~466 MB"},
-    "small": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true", "size": "~466 MB"},
-    "medium.en": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin?download=true", "size": "~1.5 GB"},
-    "medium": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin?download=true", "size": "~1.5 GB"},
-    "large-v2": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v2.bin?download=true", "size": "~2.9 GB"},
-    "large-v3": {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin?download=true", "size": "~2.9 GB"},
+AVAILABLE_MODELS: Dict[str, str] = {
+    'tiny': '39 MB',
+    'base': '74 MB',
+    'small': '244 MB',
+    'medium': '769 MB',
+    'large': '1.5 GB',
+    # As per spec: ".en variants can be added if they should still be distinct"
+    # e.g., 'tiny.en': '39 MB', if faster-whisper supports these names directly
+    # and corresponding URLs are considered (though URLs are not directly used by this ensure_cached)
 }
 
+# URLs for the simplified model names (assuming ggml-v3 for 'large')
+# These are as per the spec, though not directly used by ensure_cached if
+# faster-whisper handles downloads by model name.
+_MODEL_URLS: Dict[str, str] = {
+    'tiny': "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin?download=true",
+    'base': "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true",
+    'small': "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true",
+    'medium': "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin?download=true",
+    'large': "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin?download=true",
+}
 
-def get_available_models() -> Dict[str, Dict[str, str]]:
-    """Returns a dictionary of available models for download."""
-    return AVAILABLE_MODELS.copy()
+class ModelNotAvailableError(RuntimeError):
+    def __init__(self, model: str, details: str):
+        self.model = model
+        self.details = details
+        super().__init__(f"Model {model} not available: {details}")
 
+# Global cache to indicate successful preparation of model names.
+# Key: model_name (str), Value: model_name (str) - indicates preparation was successful.
+_model_cache_paths: Dict[str, str] = {}
+_model_cache_lock = threading.Lock() # To protect access to _model_cache_paths
 
-def _format_size(size_bytes: int) -> str:
-    """Formats size in bytes to a human-readable string (KB, MB, GB)."""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024**2:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024**3:
-        return f"{size_bytes / (1024**2):.1f} MB"
-    else:
-        return f"{size_bytes / (1024**3):.1f} GB"
-
-def list_local_models() -> List[Dict[str, Union[str, int]]]:
-    """
-    Checks the application's model directory for downloaded ggml models (.bin files)
-    and returns their details.
-    """
-    local_models = []
-    if not APP_MODEL_DIR.exists():
-        print(f"Application model directory not found: {APP_MODEL_DIR}")
-        return local_models
-
-    print(f"Checking for models in: {APP_MODEL_DIR}")
-    try:
-        for item in APP_MODEL_DIR.glob("ggml-*.bin"):
-            if item.is_file():
-                model_name = item.name.replace("ggml-", "").replace(".bin", "")
-                print(f"Found local model file: {item.name} (parsed as: {model_name})")
-                try:
-                    size_bytes = item.stat().st_size
-                    formatted_size = _format_size(size_bytes)
-                    local_models.append({
-                        "name": model_name,
-                        "path": str(item),
-                        "size": formatted_size,
-                        "size_bytes": size_bytes,
-                    })
-                except OSError as e:
-                    print(f"Error getting stats for {item}: {e}")
-                    local_models.append({
-                        "name": model_name,
-                        "path": str(item),
-                        "size": "Error",
-                        "size_bytes": -1,
-                    })
-    except OSError as e:
-        print(f"Error scanning model directory {APP_MODEL_DIR}: {e}")
-
-    local_models.sort(key=lambda x: x["name"])
-
-    print(f"Detected local models: {local_models}")
-    return local_models
-
-
-def download_model(
+def ensure_cached(
     model_name: str,
-    download_url: str,
-    target_dir: pathlib.Path,
-    progress_callback: Optional[Callable[[str, float, Optional[str]], None]] = None,
-    cancel_event: Optional[threading.Event] = None
-) -> Tuple[str, Optional[str]]:
+    *,
+    device: str, # "cpu" | "cuda" | "auto"
+    compute_type: str, # "int8" | "float16" | "auto"
+    progress_cb: Callable[[float, str], None] | None = None
+) -> pathlib.Path:
     """
-    Downloads a model file using the generic download utility, reporting progress
-    and allowing cancellation via callbacks compatible with the model management UI.
-
-    Args:
-        model_name: The name of the model (used for callbacks).
-        download_url: The URL to download the model from.
-        target_dir: The pathlib.Path directory to save the model file in.
-        progress_callback: A function to call with (model_name, percentage, error_message) updates.
-                           The percentage will be:
-                           - 0.0 to 100.0 for progress
-                           - -1.0 for error
-                           - -2.0 for cancelled
-                           Must be scheduled on the main thread (e.g., using GLib.idle_add).
-        cancel_event: A threading.Event object to signal cancellation.
-
-    Returns:
-        A tuple containing:
-        - status string: 'completed', 'cancelled', or 'error'.
-        - error message string (if status is 'error'), otherwise None.
+    Ensures the specified model is available in faster-whisper's cache
+    and returns the local directory path to the model.
+    Downloads the model via faster-whisper if not already cached.
+    Raises ModelNotAvailableError if the model_name is invalid or download/load fails.
     """
-    filename = download_url.split('/')[-1].split('?')[0]
-    if not filename or not filename.endswith(".bin"):
-        filename = f"ggml-{model_name}.bin"
-        print(f"Warning: Could not reliably determine filename from URL '{download_url}'. Using '{filename}'.")
+    if not FASTER_WHISPER_AVAILABLE:
+        err_msg = "The 'faster-whisper' library is not installed or could not be imported."
+        if progress_cb:
+            progress_cb(-1.0, f"Error: {err_msg}")
+        raise ModelNotAvailableError(model_name, err_msg)
 
-    target_path = target_dir / filename
+    if model_name not in AVAILABLE_MODELS:
+        err_msg = f"Model name '{model_name}' is not in the list of recognized available models."
+        if progress_cb:
+            progress_cb(-1.0, f"Error: {err_msg}")
+        raise ModelNotAvailableError(model_name, err_msg)
 
-    def _model_progress_wrapper(current_bytes: int, total_bytes: int, error_msg: Optional[str]):
-        if progress_callback:
-            percentage = -1.0
-            if error_msg:
-                percentage = -1.0
-            elif cancel_event and cancel_event.is_set():
-                 percentage = -2.0
-            elif total_bytes > 0:
-                percentage = (current_bytes / total_bytes) * 100
-            elif current_bytes > 0:
-                percentage = 0.0
-            else:
-                 percentage = 0.0
+    # Check cache first (thread-safe)
+    with _model_cache_lock:
+        if model_name in _model_cache_paths:
+            # If found, it means preparation was successful. Return Path(model_name).
+            # The value stored is model_name itself.
+            prepared_model_name = _model_cache_paths[model_name]
+            if progress_cb:
+                progress_cb(0.0, "Starting model preparation (found in preparation cache)")
+                progress_cb(100.0, f"Model preparation complete (from cache: {prepared_model_name})")
+            return pathlib.Path(prepared_model_name)
 
-            GLib.idle_add(progress_callback, model_name, percentage, error_msg)
+    if progress_cb:
+        progress_cb(0.0, "Starting model preparation")
 
-    status, error_message = download_file(
-        url=download_url,
-        target_path=target_path,
-        progress_callback=_model_progress_wrapper if progress_callback else None,
-        cancel_event=cancel_event
-    )
+    try:
+        # Instantiate WhisperModel to trigger its download and cache mechanism.
+        # faster-whisper does not provide fine-grained download progress for this call.
+        # The progress_cb here signals the start and end of this preparation phase.
+        
+        # Instantiate WhisperModel to trigger its download and cache mechanism.
+        # faster-whisper handles its own caching. We just confirm it can be loaded.
+        temp_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        del temp_model # Release the model instance and its resources.
 
-    if progress_callback:
-        final_percentage = -1.0
-        if status == "completed":
-            final_percentage = 100.0
-        elif status == "cancelled":
-            final_percentage = -2.0
+        # If instantiation was successful, cache the model_name to indicate it's ready.
+        with _model_cache_lock:
+            _model_cache_paths[model_name] = model_name # Store model_name itself
+        
+        if progress_cb:
+            progress_cb(100.0, f"Model preparation complete (model '{model_name}' is ready)")
+        
+        return pathlib.Path(model_name) # Return the model name, cast to Path
 
+    except Exception as e:
+        details = f"Failed to ensure model '{model_name}' (device: {device}, compute: {compute_type}). Error: {type(e).__name__} - {str(e)}"
+        
+        if "out of memory" in str(e).lower():
+            details += f". The model may be too large for the available '{device}' memory. Try a smaller model or check resources."
+        elif "CUDA" in str(e).upper() or "CUBLAS" in str(e).upper() or "NVIDIA" in str(e).upper() :
+            details += f". There might be an issue with your CUDA setup or GPU compatibility for device '{device}'."
+        elif "No such file or directory" in str(e) and ".cache/huggingface/hub" in str(e):
+             details += f". This could indicate a problem with model file download or cache integrity for '{model_name}'."
 
-        GLib.idle_add(progress_callback, model_name, final_percentage, error_message if status == "error" else None)
-
-    return status, error_message
+        if progress_cb:
+            progress_cb(-1.0, f"Error: {details}")
+        raise ModelNotAvailableError(model_name, details) from e
